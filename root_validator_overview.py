@@ -1,4 +1,4 @@
- import bittensor as bt
+import bittensor as bt
 
 POOL_CUTOFF = 1000
 
