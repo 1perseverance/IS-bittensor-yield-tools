@@ -1,7 +1,7 @@
 """
 chutes_sn64_analysis.py
 =======================
-SN64 Chutes — Intelligence Market Hypothesis Test
+SN64 Chutes — Intelligence Market Hypothesis Test + E2EE Perimeter Forensics
 Part of the Intelligence Sovereignty research suite by @im_perseverance
 
 Tests whether Bittensor functions as a market for intelligence by comparing:
@@ -12,21 +12,58 @@ Tests whether Bittensor functions as a market for intelligence by comparing:
 Join key: SS58 miner hotkey (present in both invocation CSV and metagraph)
 Time window: 7-day rolling aggregate (matches incentive calculation window)
 
+Architecture: single-pass sequential streaming fetch.
+  All miner aggregates, user aggregates, and perimeter forensic signals are
+  collected in one pass over the 168 hourly CSVs. Each hourly CSV is fetched,
+  parsed, aggregated into running counters, and discarded before the next
+  fetch begins. Peak memory: ~300-400MB regardless of dataset size.
+
+E2EE Perimeter Forensics (demand authenticity):
+  Attempts to answer: is the concentrated invocation volume genuine external
+  demand, or internally generated traffic masked by end-to-end encryption?
+  Eight independent signals are evaluated at the metadata layer without
+  touching encrypted content.
+
+  Signal weights:
+    Full weight  : token variance, chute age, miner entropy, inter-arrival,
+                   function sequence, parent invocation diversity
+    Half weight  : instance entropy (partially redundant with miner entropy)
+    Not scored   : image owner (structural constant on E2EE subnet)
+
+Outputs:
+  - Console report with snapshot metadata
+  - chutes_analysis/chutes_sn64_analysis_YYYY-MM-DD.csv
+  - chutes_analysis/chutes_sn64_divergence_YYYY-MM-DD.csv
+  - chutes_analysis/chutes_sn64_metadata_YYYY-MM-DD.json
+  - chutes_analysis/chutes_sn64_demand_users_YYYY-MM-DD.csv
+  - chutes_analysis/chutes_sn64_dominant_user_YYYY-MM-DD.json
+  - chutes_analysis/chutes_sn64_perimeter_YYYY-MM-DD.json
+
+Note:
+  This is a reference implementation. Signal weights and longitudinal
+  tracking are not included in this version.
+
 Usage:
     python chutes_sn64_analysis.py
     python chutes_sn64_analysis.py --root-threshold 1000 --alpha-threshold 1000
 """
 
+import ast
 import bittensor as bt
 import requests
 import csv
 import json
+import math
 import argparse
+import io
+import gc
+import random as _random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 NETUID               = 64
 CHUTES_API_BASE      = "https://api.chutes.ai"
 INVOCATION_WINDOW    = 7
@@ -39,23 +76,25 @@ QUALITY_WEIGHT_INVOCATION = 0.25
 QUALITY_WEIGHT_DIVERSITY  = 0.15
 QUALITY_WEIGHT_EFFICIENCY = 0.05
 
+MAX_TS = 50_000  # timestamp reservoir cap for inter-arrival analysis
+
 SEPARATOR = "=" * 100
 THIN_SEP  = "-" * 100
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def fmt_pct(val):
-    if val is None:
-        return "  N/A  "
+    if val is None: return "  N/A  "
     return f"{val*100:.2f}%"
 
 def fmt_delta(demand, emission):
-    if demand is None or emission is None:
-        return "  N/A  "
+    if demand is None or emission is None: return "  N/A  "
     delta = emission - demand
     sign  = "+" if delta >= 0 else ""
     return f"{sign}{delta*100:.2f}pp"
+
+def fmt_tao(val, decimals=4):
+    return f"{val:.{decimals}f} TAO" if val is not None else "N/A"
 
 def fmt_large(val):
     if val is None: return "N/A"
@@ -64,24 +103,65 @@ def fmt_large(val):
     return f"{val:.2f}"
 
 
-# ── Alpha Pool ─────────────────────────────────────────────────────────────────
+def parse_metrics(raw: str) -> dict:
+    """
+    Parse the metrics field from Chutes CSV exports.
+    The field uses single-quote Python dict literal format — requires
+    ast.literal_eval rather than json.loads.
+    Returns empty dict on any failure.
+    """
+    if not raw or raw.strip() in ("", "{}"): return {}
+    try:
+        result = ast.literal_eval(raw.strip())
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
 
-def fetch_alpha_pool_state(sub, netuid):
+
+def load_previous_snapshot(output_dir: Path, current_date: str) -> dict:
+    csvs = sorted([
+        f for f in output_dir.glob("chutes_sn64_analysis_*.csv")
+        if current_date not in f.name
+    ], reverse=True)
+    if not csvs:
+        print("  No previous snapshot found — trend delta will be N/A")
+        return {}
+    prev_file = csvs[0]
+    print(f"  Previous snapshot: {prev_file.name}")
+    prev = {}
+    try:
+        with open(prev_file, newline="") as f:
+            for row in csv.DictReader(f):
+                hk = row.get("hotkey", "").strip()
+                if hk:
+                    prev[hk] = {
+                        "emission_share":   float(row.get("emission_share",   0) or 0),
+                        "invocation_share": float(row.get("invocation_share", 0) or 0),
+                        "weight_share":     float(row.get("weight_share",     0) or 0),
+                    }
+    except Exception as e:
+        print(f"  Could not load previous snapshot: {e}")
+        return {}
+    print(f"  Loaded {len(prev)} miners from previous snapshot")
+    return prev
+
+
+# ── Alpha Pool Fetch ──────────────────────────────────────────────────────────
+
+def fetch_alpha_pool_state(sub, netuid: int) -> dict:
     result = {
-        "alpha_price": None, "ema_price": None,
-        "spot_ema_gap": None, "spot_ema_gap_pct": None,
-        "tao_reserves": None, "alpha_outstanding": None,
+        "alpha_price": None, "ema_price": None, "spot_ema_gap": None,
+        "spot_ema_gap_pct": None, "tao_reserves": None, "alpha_outstanding": None,
         "alpha_in_pool": None, "market_cap_tao": None,
     }
     try:
         sn = sub.subnet(netuid)
-        if sn is None:
-            return result
-        tao_in    = getattr(sn, 'tao_in', None)
-        alpha_in  = getattr(sn, 'alpha_in', None)
-        alpha_out = getattr(sn, 'alpha_out', None)
+        if sn is None: return result
+        tao_in    = getattr(sn, 'tao_in',       None)
+        alpha_in  = getattr(sn, 'alpha_in',     None)
+        alpha_out = getattr(sn, 'alpha_out',    None)
         mov_price = getattr(sn, 'moving_price', None)
-        price     = getattr(sn, 'price', None)
+        price     = getattr(sn, 'price',        None)
         if tao_in is not None:    result["tao_reserves"]      = float(tao_in)
         if alpha_in is not None:  result["alpha_in_pool"]     = float(alpha_in)
         if alpha_out is not None: result["alpha_outstanding"] = float(alpha_out)
@@ -100,234 +180,1041 @@ def fetch_alpha_pool_state(sub, netuid):
     return result
 
 
-# ── Invocation Exports ─────────────────────────────────────────────────────────
+# ── Quality Scoring ───────────────────────────────────────────────────────────
 
-def fetch_invocation_exports(window_days):
-    print(f"\nFetching Chutes invocation exports ({window_days}-day window)...")
-    now  = datetime.now(timezone.utc)
-    agg  = defaultdict(lambda: {"hotkey": None, "uid": None,
-                                 "invocation_count": 0, "compute_seconds": 0.0,
-                                 "chute_ids": set()})
-    user_agg = defaultdict(lambda: {"invocation_count": 0, "compute_seconds": 0.0,
-                                     "chute_ids": set()})
-    total_rows    = 0
-    hours_fetched = 0
-
-    for days_back in range(window_days):
-        target = now - timedelta(days=days_back)
-        for hour in range(24):
-            t   = target.replace(hour=hour, minute=0, second=0, microsecond=0)
-            url = (f"{CHUTES_API_BASE}/invocations/exports/"
-                   f"{t.year}/{t.month:02d}/{t.day:02d}/{t.hour:02d}.csv")
-            try:
-                r = requests.get(url, timeout=20)
-                if r.status_code != 200 or not r.text.strip():
-                    continue
-                lines = r.text.split("\n")
-                if len(lines) <= 1:
-                    continue
-                header = lines[0].rstrip("\r").split(",")
-
-                # Detect fields
-                hf = uf = cf = chf = usf = None
-                for f in header:
-                    fl = f.lower()
-                    if fl == "miner_hotkey":   hf  = f
-                    if fl == "miner_uid":      uf  = f
-                    if fl in ("compute_time", "compute_seconds"): cf = f
-                    if fl == "chute_id":       chf = f
-                    if fl == "chute_user_id":  usf = f
-
-                if cf is None and "started_at" in header and "completed_at" in header:
-                    cf = "__derived__"
-
-                hi  = header.index(hf)  if hf  and hf  in header else None
-                ui  = header.index(uf)  if uf  and uf  in header else None
-                ci  = header.index(cf)  if cf  and cf  in header and cf != "__derived__" else None
-                chi = header.index(chf) if chf and chf in header else None
-                usi = header.index(usf) if usf and usf in header else None
-                sa_i = header.index("started_at")   if "started_at"   in header else None
-                ca_i = header.index("completed_at") if "completed_at" in header else None
-
-                if hi is None:
-                    continue
-
-                rows = 0
-                for line in lines[1:]:
-                    if not line.strip():
-                        continue
-                    cols = line.rstrip("\r").split(",")
-                    if hi >= len(cols):
-                        continue
-                    hk = cols[hi].strip()
-                    if not hk or len(hk) < 10:
-                        continue
-
-                    rows += 1
-                    agg[hk]["hotkey"] = hk
-                    agg[hk]["invocation_count"] += 1
-                    if ui is not None and ui < len(cols) and cols[ui]:
-                        agg[hk]["uid"] = cols[ui]
-
-                    compute_val = 0.0
-                    if cf == "__derived__" and sa_i and ca_i and sa_i < len(cols) and ca_i < len(cols):
-                        try:
-                            t0 = datetime.fromisoformat(cols[sa_i].replace("Z", ""))
-                            t1 = datetime.fromisoformat(cols[ca_i].replace("Z", ""))
-                            compute_val = (t1 - t0).total_seconds()
-                        except Exception:
-                            pass
-                    elif ci is not None and ci < len(cols) and cols[ci]:
-                        try:
-                            compute_val = float(cols[ci])
-                        except (ValueError, TypeError):
-                            pass
-
-                    agg[hk]["compute_seconds"] += compute_val
-                    if chi is not None and chi < len(cols) and cols[chi]:
-                        agg[hk]["chute_ids"].add(cols[chi].strip())
-
-                    if usi is not None and usi < len(cols) and cols[usi]:
-                        user_id = cols[usi].strip()
-                        if user_id:
-                            user_agg[user_id]["invocation_count"] += 1
-                            user_agg[user_id]["compute_seconds"]  += compute_val
-                            if chi is not None and chi < len(cols) and cols[chi]:
-                                user_agg[user_id]["chute_ids"].add(cols[chi].strip())
-
-                if rows > 0:
-                    total_rows    += rows
-                    hours_fetched += 1
-
-            except Exception:
-                continue
-
-    print(f"  Hours with data: {hours_fetched}")
-    print(f"  Total rows processed: {total_rows:,}")
-    print(f"  Unique miners seen: {len(agg)}")
-    print(f"  Unique demand-side users seen: {len(user_agg)}")
-
-    total_user_inv = sum(d["invocation_count"] for d in user_agg.values()) or 1
-    total_user_cmp = sum(d["compute_seconds"]  for d in user_agg.values()) or 1
-    user_final = {}
-    for uid, d in user_agg.items():
-        user_final[uid] = {
-            "user_id":          uid,
-            "invocation_count": d["invocation_count"],
-            "compute_seconds":  round(d["compute_seconds"], 2),
-            "chute_count":      len(d["chute_ids"]),
-            "inv_share":        d["invocation_count"] / total_user_inv,
-            "compute_share":    d["compute_seconds"]  / total_user_cmp,
-        }
-
-    return agg, user_final
-
-
-def aggregate_by_miner(agg):
-    result = {}
-    for hk, data in agg.items():
-        result[hk] = {
-            "hotkey":           hk,
-            "uid":              data["uid"] or "",
-            "invocation_count": data["invocation_count"],
-            "compute_seconds":  data["compute_seconds"],
-            "chute_diversity":  len(data["chute_ids"]),
-        }
-    print(f"\n  Unique miners in aggregated demand data: {len(result)}")
-    return result
-
-
-# ── Quality Scoring ────────────────────────────────────────────────────────────
-
-def compute_quality_scores(merged):
+def compute_quality_scores(merged: list) -> list:
     active = [m for m in merged if m["invocation_count"] > 0]
-    if not active:
-        return merged
-
+    if not active: return merged
     max_div = max(m["chute_diversity"] for m in active) or 1
-
     for m in active:
-        m["_inv_per_sec"] = (m["invocation_count"] / m["compute_seconds"]
-                             if m["compute_seconds"] > 0 else 0)
+        m["_inv_per_sec"]           = (m["invocation_count"] / m["compute_seconds"]
+                                       if m["compute_seconds"] > 0 else 0)
         m["seconds_per_invocation"] = (m["compute_seconds"] / m["invocation_count"]
                                        if m["invocation_count"] > 0 else 0)
-
     active_with_compute = [m for m in active if m["seconds_per_invocation"] > 0]
     if active_with_compute:
         sorted_by_speed = sorted(active_with_compute, key=lambda m: m["seconds_per_invocation"])
-        n = len(sorted_by_speed)
+        n = len(sorted_by_speed); fast_cut = n // 3; slow_cut = 2 * n // 3
         for i, m in enumerate(sorted_by_speed):
-            if i < n // 3:       m["efficiency_tier"] = "FAST"
-            elif i < 2 * n // 3: m["efficiency_tier"] = "MID"
-            else:                 m["efficiency_tier"] = "SLOW"
+            if i < fast_cut:   m["efficiency_tier"] = "FAST"
+            elif i < slow_cut: m["efficiency_tier"] = "MID"
+            else:              m["efficiency_tier"] = "SLOW"
     for m in active:
-        if "efficiency_tier" not in m:
-            m["efficiency_tier"] = "N/A"
-
-    max_ips  = max(m["_inv_per_sec"] for m in active) or 1
+        if "efficiency_tier" not in m: m["efficiency_tier"] = "N/A"
+    max_ips = max(m["_inv_per_sec"] for m in active) or 1
     total_qs = 0.0
-
     for m in active:
         div_norm = m["chute_diversity"] / max_div
-        eff_norm = m["_inv_per_sec"] / max_ips
-        qs = (QUALITY_WEIGHT_COMPUTE    * m["compute_share"] +
+        eff_norm = m["_inv_per_sec"]    / max_ips
+        qs = (QUALITY_WEIGHT_COMPUTE    * m["compute_share"]    +
               QUALITY_WEIGHT_INVOCATION * m["invocation_share"] +
-              QUALITY_WEIGHT_DIVERSITY  * div_norm +
+              QUALITY_WEIGHT_DIVERSITY  * div_norm              +
               QUALITY_WEIGHT_EFFICIENCY * eff_norm)
-        m["_raw_quality_score"] = qs
-        total_qs += qs
-
+        m["_raw_quality_score"] = qs; total_qs += qs
     for m in active:
         m["quality_score"]        = m["_raw_quality_score"] / total_qs if total_qs > 0 else 0
-        m["delta_quality_weight"] = m["weight_share"] - m["quality_score"]
+        m["delta_quality_weight"] = m["weight_share"]   - m["quality_score"]
         m["delta_quality_emit"]   = m["emission_share"] - m["quality_score"]
-
     active_keys = {m["hotkey"] for m in active}
     for m in merged:
         if m["hotkey"] not in active_keys:
-            m["quality_score"]          = 0.0
-            m["delta_quality_weight"]   = 0.0
-            m["delta_quality_emit"]     = 0.0
-            m["efficiency_tier"]        = "N/A"
+            m["quality_score"] = 0.0; m["delta_quality_weight"] = 0.0
+            m["delta_quality_emit"] = 0.0; m["efficiency_tier"] = "N/A"
             m["seconds_per_invocation"] = 0.0
-        m.pop("_raw_quality_score", None)
-        m.pop("_inv_per_sec", None)
-
+        m.pop("_raw_quality_score", None); m.pop("_inv_per_sec", None)
     return merged
 
 
-# ── Previous Snapshot ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SINGLE-PASS SEQUENTIAL FETCH
+# All miner aggregates, user aggregates, and perimeter forensic signal data
+# collected in one sequential pass. One HTTP request at a time. Each hourly
+# CSV is parsed and immediately discarded. Peak memory: ~300-400MB.
+# ══════════════════════════════════════════════════════════════════════════════
 
-def load_previous_snapshot(output_dir, current_date):
-    csvs = sorted([
-        f for f in output_dir.glob("chutes_sn64_analysis_*.csv")
-        if current_date not in f.name
-    ], reverse=True)
-    if not csvs:
-        print("  No previous snapshot found — trend delta will be N/A")
-        return {}
-    prev_file = csvs[0]
-    print(f"  Previous snapshot: {prev_file.name}")
-    prev = {}
-    try:
-        with open(prev_file, newline="") as f:
-            for row in csv.DictReader(f):
-                hk = row.get("hotkey", "").strip()
-                if hk:
-                    prev[hk] = {
-                        "emission_share":   float(row.get("emission_share", 0) or 0),
-                        "invocation_share": float(row.get("invocation_share", 0) or 0),
-                    }
-    except Exception as e:
-        print(f"  Could not load previous snapshot: {e}")
-        return {}
-    print(f"  Loaded {len(prev)} miners from previous snapshot")
-    return prev
+def _detect_fields(header: list) -> dict:
+    """Detect field column indices from CSV header row."""
+    idx = {h.lower(): j for j, h in enumerate(header)}
+    result = {}
+    result["hi"]  = idx.get("miner_hotkey") or next(
+        (j for h, j in idx.items() if "hotkey" in h), None)
+    result["ui"]  = idx.get("miner_uid")  or idx.get("uid")
+    result["usi"] = idx.get("chute_user_id")
+    result["chi"] = idx.get("chute_id")
+    result["fni"] = idx.get("function_name")
+    result["imi"] = idx.get("image_id")
+    result["iui"] = idx.get("image_user_id")
+    result["mi"]  = idx.get("metrics")
+    result["pi"]  = idx.get("parent_invocation_id")
+    result["ii"]  = idx.get("instance_id")
+    result["sa_i"] = idx.get("started_at")
+    result["ca_i"] = idx.get("completed_at")
+    for f in ("compute_time", "compute_seconds", "duration_seconds", "compute_multiplier"):
+        if f in idx: result["ci"] = idx[f]; break
+    else:
+        result["ci"] = None
+    return result
 
 
-# ── Core Analysis ──────────────────────────────────────────────────────────────
+def fetch_all_data(window_days: int) -> tuple:
+    """
+    Single-pass sequential streaming fetch over all hourly CSVs.
 
-def run_analysis(root_tao_threshold, sn64_alpha_threshold):
+    Collects in one pass:
+      - Miner invocation/compute/TPS aggregates
+      - User invocation aggregates
+      - Perimeter forensic signals (timestamps, bigrams, token variance,
+        parent IDs, instance IDs, miner selection counts)
+
+    Returns:
+        miner_demand  : { hotkey → miner stats dict }
+        user_agg      : { user_id → user stats dict }
+        perimeter     : perimeter signal data dict
+        fields_info   : detected field names for logging
+        all_chute_ids : list of all unique chute IDs seen
+    """
+    now = datetime.now(timezone.utc)
+    urls = []
+    for days_back in range(window_days):
+        target = now - timedelta(days=days_back)
+        for hour in range(24):
+            t = target.replace(hour=hour, minute=0, second=0, microsecond=0)
+            urls.append(
+                f"{CHUTES_API_BASE}/invocations/exports"
+                f"/{t.year}/{t.month:02d}/{t.day:02d}/{t.hour:02d}.csv"
+            )
+
+    print(f"  Streaming {len(urls)} hourly archives sequentially...")
+
+    agg_miners = defaultdict(lambda: {
+        "uid": None, "invocation_count": 0, "compute_seconds": 0.0,
+        "chute_ids": set(), "tps_sum": 0.0, "tps_count": 0,
+        "ttft_sum": 0.0, "ttft_count": 0, "pass_count": 0, "pass_total": 0,
+    })
+    agg_users = defaultdict(lambda: {
+        "invocation_count": 0, "compute_seconds": 0.0,
+        "chute_ids": set(), "function_names": defaultdict(int),
+        "image_ids": defaultdict(int), "image_user_ids": defaultdict(int),
+        "hour_buckets": defaultdict(int), "instance_ids": set(), "parent_ids": set(),
+    })
+
+    # Perimeter accumulators
+    ts_reservoir    = []; ts_total_seen = 0
+    bigram_counts   = Counter()
+    trigram_counts  = Counter()
+    fn_total        = Counter()
+    TOKEN_FIELDS    = {"it", "ot", "tokens"}
+    token_welford   = defaultdict(lambda: {"n": 0, "mean": 0.0, "M2": 0.0})
+    u_miner_counts  = defaultdict(lambda: defaultdict(int))
+    n_miner_network = Counter()
+    net_instance_counts = Counter()
+
+    fields_info = {}
+    hi = ui = ci = chi = usi = fni = imi = iui = mi = pi = ii = sa_i = ca_i = None
+    total_rows = 0; hours_fetched = 0; hours_failed = 0
+
+    for i, url in enumerate(urls):
+        try:
+            r = requests.get(url, timeout=25)
+            if r.status_code != 200 or not r.text.strip():
+                hours_failed += 1; del r; continue
+            text = r.text; del r
+            reader = csv.reader(io.StringIO(text)); del text
+            try:
+                header = next(reader)
+            except StopIteration:
+                hours_failed += 1; continue
+
+            if not fields_info:
+                fields_info = _detect_fields(header)
+                hi  = fields_info.get("hi");  ui  = fields_info.get("ui")
+                ci  = fields_info.get("ci");  chi = fields_info.get("chi")
+                usi = fields_info.get("usi"); fni = fields_info.get("fni")
+                imi = fields_info.get("imi"); iui = fields_info.get("iui")
+                mi  = fields_info.get("mi");  pi  = fields_info.get("pi")
+                ii  = fields_info.get("ii");  sa_i = fields_info.get("sa_i")
+                ca_i = fields_info.get("ca_i")
+                fields_info["header"] = header
+
+            if hi is None: hours_failed += 1; continue
+
+            url_parts = url.rstrip(".csv").split("/")
+            try:
+                hour_bucket = (f"{url_parts[-4]}-{url_parts[-3]}-"
+                               f"{url_parts[-2]}T{url_parts[-1]:0>2}:00")
+            except Exception:
+                hour_bucket = "unknown"
+
+            prev_fn   = None
+            hour_rows = 0
+
+            for cols in reader:
+                if hi >= len(cols): continue
+                hk = cols[hi].strip()
+                if not hk or len(hk) < 10: continue
+                total_rows += 1; hour_rows += 1
+                n_miner_network[hk] += 1
+
+                # Compute value
+                compute_val = 0.0
+                if ci is not None and ci < len(cols) and cols[ci]:
+                    try: compute_val = float(cols[ci])
+                    except (ValueError, TypeError): pass
+                elif sa_i is not None and ca_i is not None:
+                    try:
+                        t0 = datetime.fromisoformat(cols[sa_i].replace("Z", ""))
+                        t1 = datetime.fromisoformat(cols[ca_i].replace("Z", ""))
+                        compute_val = (t1 - t0).total_seconds()
+                    except Exception: pass
+
+                # Miner aggregation
+                m = agg_miners[hk]
+                m["invocation_count"] += 1
+                m["compute_seconds"]  += compute_val
+                if ui is not None and ui < len(cols) and cols[ui]:
+                    m["uid"] = cols[ui]
+                if chi is not None and chi < len(cols) and cols[chi]:
+                    m["chute_ids"].add(cols[chi].strip())
+
+                # Metrics parsing (TPS, TTFT, pass rate, token counts)
+                m_data = {}
+                if mi is not None and mi < len(cols) and cols[mi].strip() not in ("", "{}"):
+                    m_data = parse_metrics(cols[mi])
+                    if m_data:
+                        tps = m_data.get("tps"); ttft = m_data.get("ttft"); p = m_data.get("p")
+                        if tps  is not None:
+                            try:   m["tps_sum"]  += float(tps);  m["tps_count"]  += 1
+                            except (TypeError, ValueError): pass
+                        if ttft is not None:
+                            try:   m["ttft_sum"] += float(ttft); m["ttft_count"] += 1
+                            except (TypeError, ValueError): pass
+                        if p is not None:
+                            m["pass_total"] += 1
+                            if p: m["pass_count"] += 1
+
+                # User aggregation
+                uid = cols[usi].strip() if usi is not None and usi < len(cols) else None
+                if uid:
+                    u_miner_counts[uid][hk] += 1
+                    u = agg_users[uid]
+                    u["invocation_count"] += 1
+                    u["compute_seconds"]  += compute_val
+                    u["hour_buckets"][hour_bucket] += 1
+                    if chi is not None and chi < len(cols) and cols[chi]:
+                        u["chute_ids"].add(cols[chi].strip())
+                    if fni is not None and fni < len(cols) and cols[fni]:
+                        u["function_names"][cols[fni].strip()] += 1
+                    if imi is not None and imi < len(cols) and cols[imi]:
+                        u["image_ids"][cols[imi].strip()] += 1
+                    if iui is not None and iui < len(cols) and cols[iui]:
+                        u["image_user_ids"][cols[iui].strip()] += 1
+                    if pi is not None and pi < len(cols) and cols[pi]:
+                        pid = cols[pi].strip()
+                        if pid: u["parent_ids"].add(pid)
+                    if ii is not None and ii < len(cols) and cols[ii]:
+                        iid = cols[ii].strip()
+                        if iid:
+                            u["instance_ids"].add(iid)
+                            net_instance_counts[iid] += 1
+
+                    # Perimeter: function sequences (full population counters)
+                    if fni is not None and fni < len(cols) and cols[fni].strip():
+                        fn = cols[fni].strip()
+                        fn_total[fn] += 1
+                        if prev_fn is not None:
+                            bigram_counts[(prev_fn, fn)] += 1
+                        prev_fn = fn
+
+                    # Perimeter: timestamp reservoir (inter-arrival analysis)
+                    if sa_i is not None and sa_i < len(cols) and cols[sa_i].strip():
+                        try:
+                            ts = datetime.fromisoformat(
+                                cols[sa_i].strip().replace("Z", "+00:00"))
+                            ts_total_seen += 1
+                            if len(ts_reservoir) < MAX_TS:
+                                ts_reservoir.append(ts)
+                            else:
+                                j = _random.randint(0, ts_total_seen - 1)
+                                if j < MAX_TS: ts_reservoir[j] = ts
+                        except Exception: pass
+
+                    # Perimeter: token Welford online variance
+                    if m_data:
+                        for tf in TOKEN_FIELDS:
+                            v = m_data.get(tf)
+                            if v is not None:
+                                try:
+                                    fv = float(v)
+                                    if fv > 0:
+                                        w = token_welford[tf]
+                                        w["n"] += 1
+                                        delta   = fv - w["mean"]
+                                        w["mean"] += delta / w["n"]
+                                        w["M2"]   += delta * (fv - w["mean"])
+                                except (TypeError, ValueError): pass
+
+            if hour_rows > 0: hours_fetched += 1
+            else:             hours_failed  += 1
+
+        except Exception:
+            hours_failed += 1
+
+        if (i + 1) % 24 == 0 or (i + 1) == len(urls):
+            gc.collect()
+            print(f"  ↳ {i+1}/{len(urls)} | {hours_fetched} with data | "
+                  f"{total_rows:,} rows | {len(agg_miners)} miners | {len(agg_users)} users")
+
+    print(f"\n  Hours with data: {hours_fetched} | Hours failed/missing: {hours_failed}")
+    print(f"  Total raw rows processed: {total_rows:,}")
+    print(f"  Unique miners seen: {len(agg_miners)}")
+    print(f"  Unique demand-side users seen: {len(agg_users)}")
+    if fields_info.get("header"):
+        print(f"  Fields ({len(fields_info['header'])}): {fields_info['header']}")
+
+    # Finalise miner records
+    all_chute_ids = set()
+    miner_demand  = {}
+    for hk, data in agg_miners.items():
+        all_chute_ids.update(data["chute_ids"])
+        miner_demand[hk] = {
+            "hotkey":           hk,
+            "uid":              data["uid"],
+            "invocation_count": data["invocation_count"],
+            "compute_seconds":  round(data["compute_seconds"], 2),
+            "chute_diversity":  len(data["chute_ids"]),
+            "avg_tps":          data["tps_sum"]  / data["tps_count"]  if data["tps_count"]  > 0 else 0.0,
+            "avg_ttft":         data["ttft_sum"] / data["ttft_count"] if data["ttft_count"] > 0 else 0.0,
+            "pass_rate":        data["pass_count"] / data["pass_total"] if data["pass_total"] > 0 else None,
+        }
+    print(f"  Unique chute IDs seen: {len(all_chute_ids)}")
+    tps_n = sum(1 for m in miner_demand.values() if m["avg_tps"] > 0)
+    print(f"  Miners with native TPS (from metrics field): {tps_n}/{len(miner_demand)}")
+
+    # Finalise user records
+    total_inv = sum(d["invocation_count"] for d in agg_users.values()) or 1
+    total_cmp = sum(d["compute_seconds"]  for d in agg_users.values()) or 1
+    user_agg  = {}
+    for user_id, data in agg_users.items():
+        user_agg[user_id] = {
+            "user_id":          user_id,
+            "invocation_count": data["invocation_count"],
+            "compute_seconds":  round(data["compute_seconds"], 2),
+            "chute_count":      len(data["chute_ids"]),
+            "chute_ids":        data["chute_ids"],
+            "instance_ids":     data["instance_ids"],
+            "parent_ids":       data["parent_ids"],
+            "inv_share":        data["invocation_count"] / total_inv,
+            "compute_share":    data["compute_seconds"]  / total_cmp,
+            "function_names":   dict(data["function_names"]),
+            "image_ids":        dict(data["image_ids"]),
+            "image_user_ids":   dict(data["image_user_ids"]),
+            "hour_buckets":     dict(data["hour_buckets"]),
+        }
+
+    # Finalise Welford token CV
+    token_cv = {}
+    for field, w in token_welford.items():
+        if w["n"] >= 10:
+            variance = w["M2"] / w["n"]
+            std      = variance ** 0.5
+            cv       = std / w["mean"] if w["mean"] > 0 else 0
+            token_cv[field] = {
+                "n": w["n"], "mean": round(w["mean"], 1),
+                "std": round(std, 1), "cv": round(cv, 4),
+            }
+
+    net_total      = sum(n_miner_network.values()) or 1
+    network_shares = {hk: c / net_total for hk, c in n_miner_network.items()}
+    ts_reservoir.sort()
+
+    print(f"  Perimeter: {len(ts_reservoir):,} timestamps | "
+          f"{sum(bigram_counts.values()):,} bigrams | token fields: {list(token_cv.keys())}")
+
+    perimeter = {
+        "dominant_timestamps":     ts_reservoir,
+        "dominant_bigram_counts":  bigram_counts,
+        "dominant_trigram_counts": trigram_counts,
+        "dominant_fn_totals":      fn_total,
+        "dominant_token_cv":       token_cv,
+        "user_miner_counts":       dict(u_miner_counts),
+        "network_miner_shares":    network_shares,
+        "network_instance_counts": dict(net_instance_counts),
+        "dominant_inv_count":      0,
+        "dominant_parent_ids":     set(),
+        "dominant_instance_ids":   set(),
+    }
+    return miner_demand, user_agg, perimeter, fields_info, list(all_chute_ids)
+
+
+def populate_perimeter_dominant(perimeter: dict, user_agg: dict, dominant_user_id: str) -> dict:
+    """Copy dominant user's already-collected data into perimeter dict."""
+    dom = user_agg.get(dominant_user_id, {})
+    perimeter["dominant_inv_count"]    = dom.get("invocation_count", 0)
+    perimeter["dominant_parent_ids"]   = dom.get("parent_ids",   set())
+    perimeter["dominant_instance_ids"] = dom.get("instance_ids", set())
+    perimeter["user_miner_counts"] = {
+        dominant_user_id: perimeter["user_miner_counts"].get(dominant_user_id, {})
+    }
+    return perimeter
+
+
+# ── Chute Metadata ────────────────────────────────────────────────────────────
+
+def fetch_chute_metadata(chute_ids: set) -> dict:
+    results = {}; ids = list(chute_ids)[:200]
+    def _fetch_one(cid):
+        try:
+            r = requests.get(f"{CHUTES_API_BASE}/chutes/{cid}", timeout=8)
+            if r.status_code == 200:
+                d = r.json()
+                return cid, {
+                    "name":           d.get("name", ""),
+                    "description":    (d.get("description") or "")[:120],
+                    "model":          d.get("model_name") or d.get("model") or "",
+                    "owner_username": d.get("username") or d.get("owner", {}).get("username", ""),
+                    "public":         d.get("public", True),
+                    "chute_type":     d.get("chute_type") or d.get("type", ""),
+                    "created_at":     d.get("created_at") or d.get("created") or d.get("creation_date"),
+                }
+        except Exception: pass
+        return cid, None
+    print(f"  Fetching metadata for {len(ids)} chutes (40 workers)...")
+    fetched = 0
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        for cid, meta in ex.map(_fetch_one, ids):
+            if meta: results[cid] = meta; fetched += 1
+    print(f"  Chute metadata fetched: {fetched}/{len(ids)}")
+    return results
+
+
+# ── Root Validators ───────────────────────────────────────────────────────────
+
+def get_root_validator_stakes(sub) -> dict:
+    print("\nLoading Root metagraph (netuid=0)...")
+    root_meta   = sub.metagraph(0)
+    root_stakes = {}
+    for uid in range(len(root_meta.hotkeys)):
+        stake = float(root_meta.stake[uid])
+        if stake >= ROOT_TAO_THRESHOLD:
+            root_stakes[root_meta.hotkeys[uid]] = stake
+    print(f"  Root validators with {ROOT_TAO_THRESHOLD:,.0f}+ TAO: {len(root_stakes)}")
+    return root_stakes
+
+
+# ── Dominant User Report ──────────────────────────────────────────────────────
+
+def analyze_dominant_user(user_data: dict, chute_meta: dict, date: str) -> dict:
+    user_id         = user_data["user_id"]
+    inv_count       = user_data["invocation_count"]
+    cmp_secs        = user_data["compute_seconds"]
+    inv_share       = user_data["inv_share"]
+    cmp_share       = user_data["compute_share"]
+    fn_counts       = user_data.get("function_names", {})
+    img_user_counts = user_data.get("image_user_ids", {})
+    hour_counts     = user_data.get("hour_buckets",   {})
+    chute_ids       = user_data.get("chute_ids",      set())
+
+    total_fn  = sum(fn_counts.values())       or 1
+    total_imu = sum(img_user_counts.values()) or 1
+    fn_sorted       = sorted(fn_counts.items(),       key=lambda x: x[1], reverse=True)
+    img_user_sorted = sorted(img_user_counts.items(), key=lambda x: x[1], reverse=True)
+    img_sorted      = sorted(user_data.get("image_ids", {}).items(), key=lambda x: x[1], reverse=True)
+
+    hour_of_day = defaultdict(int)
+    for bucket, cnt in hour_counts.items():
+        try: h = int(bucket.split("T")[1].split(":")[0]); hour_of_day[h] += cnt
+        except Exception: pass
+
+    peak_hour   = max(hour_of_day, key=lambda h: hour_of_day[h]) if hour_of_day else None
+    trough_hour = min(hour_of_day, key=lambda h: hour_of_day[h]) if hour_of_day else None
+    hourly_vals = [hour_of_day.get(h, 0) for h in range(24)]
+    mean_hourly = sum(hourly_vals) / 24 if hourly_vals else 0
+    cv = 0.0
+    if mean_hourly > 0:
+        variance = sum((v - mean_hourly) ** 2 for v in hourly_vals) / 24
+        cv = (variance ** 0.5) / mean_hourly
+    peak_vol   = max(hourly_vals) if hourly_vals else 1
+    active_hrs = sum(1 for v in hourly_vals if v > peak_vol * 0.1)
+
+    if cv > 1.5:   temporal_pattern = "BURSTY"
+    elif cv > 0.7: temporal_pattern = "MIXED"
+    else:          temporal_pattern = "STEADY"
+
+    model_counts = defaultdict(int); owner_counts = defaultdict(int)
+    type_counts  = defaultdict(int); known_chutes = 0
+    for cid in chute_ids:
+        meta = chute_meta.get(cid)
+        if not meta: continue
+        known_chutes += 1
+        if meta["model"]:          model_counts[meta["model"]] += 1
+        if meta["owner_username"]: owner_counts[meta["owner_username"]] += 1
+        if meta["chute_type"]:     type_counts[meta["chute_type"]] += 1
+
+    fn_lower = {k.lower(): v for k, v in fn_counts.items()}
+    workload_signals = []
+    if any("embed" in f for f in fn_lower):                                            workload_signals.append("EMBEDDING")
+    if any(f in fn_lower for f in ("generate", "chat", "complete", "completions")):    workload_signals.append("TEXT_GENERATION")
+    if any("vision" in f or "classify_image" in f for f in fn_lower):                 workload_signals.append("VISION")
+    if any("audio" in f or "speech" in f or "transcribe" in f or "speak" in f for f in fn_lower): workload_signals.append("AUDIO")
+    if not workload_signals: workload_signals.append("UNKNOWN")
+
+    print(f"\n{SEPARATOR}")
+    print(f"  DOMINANT USER DEEP ANALYSIS")
+    print(f"  Observable metadata fingerprint — no encrypted content accessed")
+    print(THIN_SEP)
+    print(f"  User ID      : {user_id}")
+    print(f"  Invocations  : {inv_count:,}  ({inv_share*100:.2f}% of subnet)")
+    print(f"  Compute (7d) : {cmp_secs/3600:,.1f} GPU-hours  ({cmp_share*100:.2f}% of subnet)")
+    print(f"  Unique chutes: {len(chute_ids)}  ({known_chutes} with public metadata)")
+    print(f"  Parent IDs   : {len(user_data.get('parent_ids', set())):,}  (distinct request origins, lower bound)")
+    print(f"  Instance IDs : {len(user_data.get('instance_ids', set())):,}  (distinct compute instances used)")
+    print(f"\n  FUNCTION NAME DISTRIBUTION"); print(THIN_SEP)
+    print(f"  {'Function':<40}  {'Count':>10}  {'Share':>8}"); print(THIN_SEP)
+    for fn, cnt in fn_sorted[:15]:
+        print(f"  {fn:<40}  {cnt:>10,}  {cnt/total_fn*100:>7.2f}%")
+    print(f"\n  INFERRED WORKLOAD TYPES: {', '.join(workload_signals)}")
+    print(f"\n  IMAGE OWNER DISTRIBUTION")
+    print(f"  NOTE: On this E2EE subnet all traffic routes through Chutes inference.")
+    print(f"  Platform owns its own model images — architecturally expected, not a signal.")
+    print(THIN_SEP)
+    print(f"  {'Owner (image_user_id truncated)':40}  {'Invocations':>12}  {'Share':>8}"); print(THIN_SEP)
+    for owner, cnt in img_user_sorted[:5]:
+        owner_display = owner[:38] + ".." if len(owner) > 40 else owner
+        print(f"  {owner_display:40}  {cnt:>12,}  {cnt/total_imu*100:>7.2f}%")
+    if owner_counts:
+        print(f"\n  CHUTE OWNER DISTRIBUTION"); print(THIN_SEP)
+        for owner, cnt in sorted(owner_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+            print(f"  {owner:<40}  {cnt:>4} chutes")
+    if model_counts:
+        print(f"\n  MODEL DISTRIBUTION"); print(THIN_SEP)
+        for model, cnt in sorted(model_counts.items(), key=lambda x: x[1], reverse=True)[:15]:
+            print(f"  {model:<60}  {cnt:>4} chutes")
+    print(f"\n  TEMPORAL PROFILE (hourly distribution, UTC)"); print(THIN_SEP)
+    print(f"  Pattern      : {temporal_pattern}")
+    print(f"  CV (hourly)  : {cv:.3f}")
+    print(f"  Active hours : {active_hrs}/24")
+    if peak_hour   is not None: print(f"  Peak hour (UTC)  : {peak_hour:02d}:00")
+    if trough_hour is not None: print(f"  Trough hour (UTC): {trough_hour:02d}:00")
+    print(); peak_bar = max(hourly_vals) if hourly_vals else 1
+    print(f"  UTC  Invocations"); print(f"  {'-'*60}")
+    for h in range(24):
+        vol = hour_of_day.get(h, 0)
+        bar = int(vol / peak_bar * 40) if peak_bar > 0 else 0
+        print(f"  {h:02d}:00  {'█' * bar}  {vol:,}")
+
+    return {
+        "date": date, "user_id": user_id, "invocation_count": inv_count,
+        "compute_gpu_hours": round(cmp_secs / 3600, 2),
+        "inv_share": round(inv_share, 6), "compute_share": round(cmp_share, 6),
+        "chute_count": len(chute_ids), "chutes_with_metadata": known_chutes,
+        "temporal_pattern": temporal_pattern, "cv_hourly": round(cv, 4),
+        "active_hours_24": active_hrs, "peak_hour_utc": peak_hour, "trough_hour_utc": trough_hour,
+        "workload_types": workload_signals,
+        "distinct_parent_ids":   len(user_data.get("parent_ids",   set())),
+        "distinct_instance_ids": len(user_data.get("instance_ids", set())),
+        "top_functions":    [{"name": fn, "count": cnt, "share": round(cnt/total_fn, 4)}
+                             for fn, cnt in fn_sorted[:20]],
+        "top_image_owners": [{"image_user_id": o, "count": cnt, "share": round(cnt/total_imu, 4)}
+                             for o, cnt in img_user_sorted[:10]],
+        "top_images":       [{"image_id": i, "count": cnt} for i, cnt in img_sorted[:20]],
+        "chute_owners":            dict(sorted(owner_counts.items(), key=lambda x: x[1], reverse=True)[:20]),
+        "model_distribution":      dict(sorted(model_counts.items(), key=lambda x: x[1], reverse=True)[:20]),
+        "chute_type_distribution": dict(type_counts),
+        "hourly_distribution":     {f"{h:02d}:00": hour_of_day.get(h, 0) for h in range(24)},
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# E2EE PERIMETER FORENSICS — EIGHT-SIGNAL COMPOSITE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def analyze_token_variance(token_cv: dict) -> dict:
+    """Signal 1: Token count variance (from metrics field it/ot/tokens)."""
+    result = {
+        "signal": "TOKEN_COUNT_VARIANCE", "fields_found": sorted(token_cv.keys()),
+        "distributions": {}, "verdict": None, "confidence": None, "note": None,
+    }
+    if not token_cv:
+        result["verdict"] = "INCONCLUSIVE"; result["confidence"] = 0.0
+        result["note"]    = "No token count data found in metrics field."
+        return result
+    high_cv = 0; low_cv = 0; total = 0
+    for field, stats in token_cv.items():
+        result["distributions"][field] = stats
+        if stats.get("n", 0) >= 10:
+            total += 1; cv = stats.get("cv", 0)
+            if cv > 0.5:   high_cv += 1
+            elif cv < 0.2: low_cv  += 1
+    if total == 0:
+        result["verdict"] = "INCONCLUSIVE"; result["confidence"] = 0.0
+        result["note"]    = "Insufficient token count data."
+        return result
+    if high_cv > low_cv:
+        result["verdict"]    = "LEANS_EXTERNAL"; result["confidence"] = round(high_cv / total, 2)
+        result["note"]       = (f"High token count variance (CV>0.5) across {high_cv}/{total} fields. "
+                                f"Diverse request sizes — consistent with heterogeneous external demand.")
+    elif low_cv > high_cv:
+        result["verdict"]    = "LEANS_SYNTHETIC"; result["confidence"] = round(low_cv / total, 2)
+        result["note"]       = (f"Low token count variance (CV<0.2) — uniform sizes consistent with batch.")
+    else:
+        result["verdict"] = "INCONCLUSIVE"; result["confidence"] = 0.3
+        result["note"]    = "Mixed token variance signals."
+    return result
+
+
+def analyze_chute_age(user_data: dict, chute_meta: dict) -> dict:
+    """Signal 2: Age distribution of invoked chutes."""
+    result = {
+        "signal": "CHUTE_AGE_ANALYSIS", "chutes_analyzed": 0, "chutes_with_age": 0,
+        "age_distribution": {}, "verdict": None, "confidence": None, "note": None,
+    }
+    chute_ids = user_data.get("chute_ids", set())
+    if not chute_ids:
+        result["verdict"] = "INCONCLUSIVE"; result["note"] = "No chute IDs available."
+        return result
+    now = datetime.now(timezone.utc)
+    ages_days = []; fresh = 0; recent = 0; established = 0
+    for cid in chute_ids:
+        created = chute_meta.get(cid, {}).get("created_at")
+        if not created: continue
+        try:
+            if isinstance(created, str):
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            elif isinstance(created, (int, float)):
+                dt = datetime.fromtimestamp(created, tz=timezone.utc)
+            else: continue
+            age = (now - dt).days; ages_days.append(age)
+            if age < 7:    fresh       += 1
+            elif age < 30: recent      += 1
+            else:          established += 1
+        except Exception: continue
+    result["chutes_analyzed"] = len(chute_ids); result["chutes_with_age"] = len(ages_days)
+    if not ages_days:
+        result["verdict"] = "INCONCLUSIVE"; result["confidence"] = 0.0
+        result["note"]    = "Chute metadata does not include creation timestamps."
+        return result
+    avg_age = sum(ages_days) / len(ages_days)
+    result["age_distribution"] = {
+        "fresh_lt7d": fresh, "recent_7_30d": recent, "established_gt30d": established,
+        "avg_age_days": round(avg_age, 1), "min_age_days": min(ages_days),
+        "max_age_days": max(ages_days), "median_age_days": sorted(ages_days)[len(ages_days)//2],
+    }
+    n = len(ages_days); ep = established / n; fp = fresh / n
+    if ep > 0.6:
+        result["verdict"] = "LEANS_EXTERNAL"; result["confidence"] = round(ep, 2)
+        result["note"]    = (f"{ep*100:.0f}% of invoked chutes are 30+ days old. "
+                             f"Consistent with organic discovery of established public models.")
+    elif fp > 0.5:
+        result["verdict"] = "LEANS_SYNTHETIC"; result["confidence"] = round(fp, 2)
+        result["note"]    = f"{fp*100:.0f}% of invoked chutes are <7 days old."
+    else:
+        result["verdict"] = "MIXED"; result["confidence"] = 0.4
+        result["note"]    = "Mix of fresh and established chutes — no strong signal."
+    return result
+
+
+def analyze_miner_selection_entropy(
+    user_miner_counts: dict, network_miner_shares: dict, dominant_user_id: str
+) -> dict:
+    """Signal 3: Miner selection entropy vs network baseline."""
+    result = {
+        "signal": "MINER_SELECTION_ENTROPY", "dominant_user_miners": 0,
+        "network_miners": 0, "entropy_dominant": None, "entropy_network": None,
+        "entropy_ratio": None, "kl_divergence": None, "top_miner_affinity": [],
+        "verdict": None, "confidence": None, "note": None,
+    }
+    dom_counts = user_miner_counts.get(dominant_user_id, {})
+    if not dom_counts or not network_miner_shares:
+        result["verdict"] = "INCONCLUSIVE"; result["note"] = "Insufficient miner selection data."
+        return result
+    dom_total = sum(dom_counts.values())
+    dom_dist  = {hk: cnt / dom_total for hk, cnt in dom_counts.items()}
+    def shannon(d): return -sum(p * math.log2(p) for p in d.values() if p > 0)
+    h_dom = shannon(dom_dist); h_network = shannon(network_miner_shares)
+    result["dominant_user_miners"] = len(dom_dist); result["network_miners"] = len(network_miner_shares)
+    result["entropy_dominant"]     = round(h_dom, 4); result["entropy_network"] = round(h_network, 4)
+    result["entropy_ratio"]        = round(h_dom / h_network, 4) if h_network > 0 else None
+    kl = sum(p * math.log2(p / network_miner_shares[hk])
+             for hk, p in dom_dist.items()
+             if hk in network_miner_shares and p > 0 and network_miner_shares[hk] > 0)
+    result["kl_divergence"] = round(kl, 4)
+    for hk, share in sorted(dom_dist.items(), key=lambda x: x[1], reverse=True)[:5]:
+        ns = network_miner_shares.get(hk, 0)
+        result["top_miner_affinity"].append({
+            "hotkey_short": hk[:8]+"...", "user_share": round(share, 4),
+            "network_share": round(ns, 4),
+            "affinity_ratio": round(share / ns, 2) if ns > 0 else None,
+        })
+    ratio = result["entropy_ratio"]
+    if ratio is not None:
+        if ratio > 0.85:
+            result["verdict"] = "LEANS_EXTERNAL"; result["confidence"] = round(min(ratio, 1.0), 2)
+            result["note"]    = (f"Entropy ratio {ratio:.4f} — miner selection closely matches "
+                                 f"load balancer distribution. Consistent with proxy routing.")
+        elif ratio < 0.5:
+            result["verdict"] = "LEANS_SYNTHETIC"; result["confidence"] = round(1 - ratio, 2)
+            result["note"]    = f"Entropy ratio {ratio:.4f} — concentrated selection suggests internal routing."
+        else:
+            result["verdict"] = "AMBIGUOUS"; result["confidence"] = 0.4
+            result["note"]    = f"Entropy ratio {ratio:.4f} — partial match to network distribution."
+    return result
+
+
+def analyze_inter_arrival(timestamps: list) -> dict:
+    """Signal 4: Inter-arrival time distribution."""
+    result = {
+        "signal": "INTER_ARRIVAL_DISTRIBUTION", "n_events": len(timestamps),
+        "n_intervals": 0, "stats": {}, "pattern_classification": None,
+        "regularity_score": None, "burst_ratio": None,
+        "verdict": None, "confidence": None, "note": None,
+    }
+    if len(timestamps) < 10:
+        result["verdict"] = "INCONCLUSIVE"; result["note"] = "Fewer than 10 timestamped events."
+        return result
+    intervals = [(timestamps[i] - timestamps[i-1]).total_seconds()
+                 for i in range(1, len(timestamps))
+                 if (timestamps[i] - timestamps[i-1]).total_seconds() >= 0]
+    if len(intervals) < 5:
+        result["verdict"] = "INCONCLUSIVE"; result["note"] = "Fewer than 5 valid intervals."
+        return result
+    n = len(intervals); mean = sum(intervals) / n
+    var = sum((x - mean) ** 2 for x in intervals) / n
+    std = var ** 0.5; cv = std / mean if mean > 0 else 0
+    srt = sorted(intervals)
+    result["n_intervals"] = n
+    result["stats"] = {
+        "mean_sec": round(mean, 3), "std_sec": round(std, 3), "cv": round(cv, 4),
+        "min_sec":  round(srt[0], 3), "p25_sec": round(srt[n//4], 3),
+        "median_sec": round(srt[n//2], 3), "p75_sec": round(srt[3*n//4], 3),
+        "p90_sec":  round(srt[int(n*0.9)], 3), "max_sec": round(srt[-1], 3),
+    }
+    result["regularity_score"] = round(cv, 4)
+    burst_threshold = mean * 0.1 if mean > 0 else 1
+    result["burst_ratio"] = round(sum(1 for x in intervals if x < burst_threshold) / n, 4)
+    if cv < 0.3:
+        result["pattern_classification"] = "FIXED_CADENCE"
+        result["verdict"] = "LEANS_SYNTHETIC"; result["confidence"] = round(1 - cv, 2)
+        result["note"]    = f"CV={cv:.3f} — highly regular. Characteristic of scheduled batch jobs."
+    elif cv < 0.8:
+        result["pattern_classification"] = "SEMI_REGULAR"
+        result["verdict"] = "AMBIGUOUS"; result["confidence"] = 0.4
+        result["note"]    = f"CV={cv:.3f} — moderately regular."
+    elif cv < 1.5:
+        result["pattern_classification"] = "POISSON_LIKE"
+        result["verdict"] = "LEANS_EXTERNAL"; result["confidence"] = round(min(cv / 1.5, 0.8), 2)
+        result["note"]    = f"CV={cv:.3f} — consistent with Poisson process. Diverse human-originated requests."
+    else:
+        result["pattern_classification"] = "BURSTY"
+        result["verdict"] = "LEANS_EXTERNAL"; result["confidence"] = round(min(cv / 2.0, 0.85), 2)
+        result["note"]    = (f"CV={cv:.3f}, burst ratio={result['burst_ratio']*100:.1f}%. "
+                             f"Bursty with quiet gaps — event-driven external demand.")
+    return result
+
+
+def analyze_function_sequences(
+    bigram_counts: dict, trigram_counts: dict, fn_total_counts: dict
+) -> dict:
+    """Signal 5: Function sequence co-occurrence (full population counters)."""
+    total_calls   = sum(fn_total_counts.values())
+    unique_fns    = set(fn_total_counts.keys())
+    total_bigrams = sum(bigram_counts.values())
+    result = {
+        "signal": "FUNCTION_SEQUENCE_COOCCURRENCE",
+        "n_calls": total_calls, "unique_functions": len(unique_fns),
+        "bigram_distribution": {}, "trigram_top10": [],
+        "monotonic_ratio": None, "pipeline_patterns": [],
+        "sequence_entropy": None, "verdict": None, "confidence": None, "note": None,
+    }
+    if total_calls < 20 or total_bigrams < 5:
+        result["verdict"] = "INCONCLUSIVE"; result["note"] = "Insufficient function call data."
+        return result
+    for (a, b), cnt in sorted(bigram_counts.items(), key=lambda x: x[1], reverse=True)[:20]:
+        result["bigram_distribution"][f"{a} → {b}"] = {"count": cnt, "share": round(cnt/total_bigrams, 4)}
+    total_trigrams = sum(trigram_counts.values())
+    for (a, b, c), cnt in sorted(trigram_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+        result["trigram_top10"].append({"pattern": f"{a} → {b} → {c}", "count": cnt,
+                                        "share": round(cnt/max(total_trigrams,1), 4)})
+    same_count = sum(cnt for (a, b), cnt in bigram_counts.items() if a == b)
+    mono = round(same_count / total_bigrams, 4) if total_bigrams > 0 else 0
+    result["monotonic_ratio"] = mono
+    probs       = [cnt / total_bigrams for cnt in bigram_counts.values()]
+    seq_entropy = -sum(p * math.log2(p) for p in probs if p > 0)
+    max_entropy = math.log2(len(bigram_counts)) if len(bigram_counts) > 1 else 1
+    normalized  = seq_entropy / max_entropy if max_entropy > 0 else 0
+    result["sequence_entropy"] = round(seq_entropy, 4)
+    fn_lower = {f.lower() for f in unique_fns}
+    patterns = []
+    bg_lower = {(a.lower(), b.lower()): cnt for (a, b), cnt in bigram_counts.items()}
+    if any("embed" in f for f in fn_lower):
+        rag = [k for k in bg_lower if "embed" in k[0] and
+               any(g in k[1] for g in ("generate", "chat", "complete"))]
+        if rag: patterns.append("RAG_PIPELINE")
+    if mono > 0.8: patterns.append("BATCH_INFERENCE")
+    if (any("vision" in f or "classify_image" in f for f in fn_lower) and
+            any(f in fn_lower for f in ("generate", "chat", "complete"))):
+        patterns.append("MULTI_MODAL")
+    result["pipeline_patterns"] = patterns
+    if mono > 0.85 and normalized < 0.3:
+        result["verdict"] = "LEANS_SYNTHETIC"; result["confidence"] = round(mono, 2)
+        result["note"]    = f"Monotonic ratio {mono:.2%} with low entropy — batch inference pattern."
+    elif len(patterns) >= 2 or normalized > 0.7:
+        result["verdict"] = "LEANS_EXTERNAL"; result["confidence"] = round(min(normalized, 0.85), 2)
+        result["note"]    = (f"High sequence diversity (entropy={seq_entropy:.2f}, "
+                             f"{len(unique_fns)} unique functions). Detected: {', '.join(patterns) or 'diverse mix'}.")
+    elif len(patterns) == 1 and "BATCH_INFERENCE" in patterns:
+        result["verdict"] = "LEANS_SYNTHETIC"; result["confidence"] = 0.6
+        result["note"]    = "Single-pattern batch inference detected."
+    else:
+        result["verdict"] = "AMBIGUOUS"; result["confidence"] = 0.4
+        result["note"]    = f"Monotonic ratio {mono:.2%}, {len(unique_fns)} unique functions. No strong signal."
+    return result
+
+
+def analyze_image_owner_structural(user_data: dict) -> dict:
+    """
+    Signal 6: Image owner provenance.
+    NOT_APPLICABLE on this subnet — structural constant.
+    The Chutes platform owns its own inference images by design. All traffic,
+    internal or external, routes through this infrastructure. Image ownership
+    cannot distinguish real demand from artificial demand and is excluded
+    from composite scoring.
+    """
+    img_user_counts = user_data.get("image_user_ids", {})
+    total = sum(img_user_counts.values()) or 1
+    top1  = sorted(img_user_counts.values(), reverse=True)[0] / total if img_user_counts else 0
+    return {
+        "signal": "IMAGE_OWNER_PROVENANCE",
+        "unique_image_owners": len(img_user_counts), "top1_owner_share": round(top1, 4),
+        "verdict": "NOT_APPLICABLE", "confidence": 0.0,
+        "note": ("Structural constant on E2EE subnet. Platform owns its own inference images "
+                 "by design. Cannot distinguish internal from external demand. Excluded from scoring."),
+        "excluded_from_composite": True,
+    }
+
+
+def analyze_parent_invocation_diversity(dom_inv_count: int, dom_parent_ids: set) -> dict:
+    """Signal 7: Parent invocation ID diversity."""
+    result = {
+        "signal": "PARENT_INVOCATION_DIVERSITY",
+        "dominant_inv_count": dom_inv_count, "distinct_parent_ids": len(dom_parent_ids),
+        "parent_to_inv_ratio": None, "verdict": None, "confidence": None, "note": None,
+    }
+    if not dom_parent_ids or dom_inv_count == 0:
+        result["verdict"] = "INCONCLUSIVE"; result["confidence"] = 0.0
+        result["note"]    = "No parent_invocation_id data available."
+        return result
+    ratio = len(dom_parent_ids) / dom_inv_count
+    result["parent_to_inv_ratio"] = round(ratio, 4)
+    if ratio > 0.7:
+        result["verdict"] = "LEANS_EXTERNAL"; result["confidence"] = round(min(ratio, 1.0), 2)
+        result["note"]    = (f"{len(dom_parent_ids):,} distinct parent IDs across {dom_inv_count:,} "
+                             f"invocations (ratio={ratio:.2%}). Consistent with many independent external callers.")
+    elif ratio < 0.1:
+        result["verdict"] = "LEANS_SYNTHETIC"; result["confidence"] = round(min(1 - ratio*5, 0.9), 2)
+        result["note"]    = f"ratio={ratio:.2%} — very low parent diversity. Few orchestrators, high fan-out."
+    elif ratio < 0.3:
+        result["verdict"] = "AMBIGUOUS"; result["confidence"] = 0.4
+        result["note"]    = f"ratio={ratio:.2%} — moderate fan-out. No strong signal."
+    else:
+        result["verdict"] = "LEANS_EXTERNAL"; result["confidence"] = round(ratio, 2)
+        result["note"]    = f"ratio={ratio:.2%} — substantial parent diversity."
+    return result
+
+
+def analyze_instance_entropy(
+    dom_instance_ids: set, dom_inv_count: int, network_instance_counts: dict
+) -> dict:
+    """Signal 8: Instance ID entropy (half weight)."""
+    result = {
+        "signal": "INSTANCE_ID_ENTROPY",
+        "dominant_instance_ids": len(dom_instance_ids),
+        "network_instance_ids":  len(network_instance_counts),
+        "instance_to_inv_ratio": None, "entropy_dominant": None,
+        "verdict": None, "confidence": None, "note": None, "composite_weight": 0.5,
+    }
+    if not dom_instance_ids or dom_inv_count == 0:
+        result["verdict"] = "INCONCLUSIVE"; result["confidence"] = 0.0
+        result["note"]    = "No instance_id data available."
+        return result
+    result["instance_to_inv_ratio"] = round(len(dom_instance_ids) / dom_inv_count, 6)
+    if not network_instance_counts:
+        result["verdict"] = "INCONCLUSIVE"; result["confidence"] = 0.0
+        result["note"]    = "No network instance distribution for comparison."
+        return result
+    net_unique   = len(network_instance_counts)
+    dom_coverage = len(dom_instance_ids) / net_unique if net_unique > 0 else 0
+    result["entropy_dominant"] = round(dom_coverage, 4)
+    if dom_coverage > 0.7:
+        result["verdict"] = "LEANS_EXTERNAL"; result["confidence"] = round(dom_coverage, 2)
+        result["note"]    = (f"Accessed {len(dom_instance_ids):,} instances ({dom_coverage:.0%} of network). "
+                             f"Broad coverage consistent with load balancer routing diverse demand.")
+    elif dom_coverage < 0.3:
+        result["verdict"] = "LEANS_SYNTHETIC"; result["confidence"] = round(1 - dom_coverage, 2)
+        result["note"]    = f"Narrow instance coverage ({dom_coverage:.0%}) — consistent with internal routing."
+    else:
+        result["verdict"] = "AMBIGUOUS"; result["confidence"] = 0.4
+        result["note"]    = f"Moderate instance coverage ({dom_coverage:.0%})."
+    return result
+
+
+def compute_composite_verdict(signals: list) -> dict:
+    SIGNAL_WEIGHTS = {
+        "TOKEN_COUNT_VARIANCE":           1.0,
+        "CHUTE_AGE_ANALYSIS":             1.0,
+        "MINER_SELECTION_ENTROPY":        1.0,
+        "INTER_ARRIVAL_DISTRIBUTION":     1.0,
+        "FUNCTION_SEQUENCE_COOCCURRENCE": 1.0,
+        "PARENT_INVOCATION_DIVERSITY":    1.0,
+        "INSTANCE_ID_ENTROPY":            0.5,
+        "IMAGE_OWNER_PROVENANCE":         0.0,  # excluded — structural constant
+    }
+    external_score = 0.0; synthetic_score = 0.0; total_weight = 0.0; reasoning = []
+    for sig in signals:
+        verdict     = sig.get("verdict", "INCONCLUSIVE")
+        confidence  = sig.get("confidence", 0.0) or 0.0
+        signal_name = sig.get("signal", "UNKNOWN")
+        weight      = SIGNAL_WEIGHTS.get(signal_name, 1.0)
+        if verdict == "NOT_APPLICABLE":
+            reasoning.append(f"  {signal_name}: NOT_APPLICABLE (excluded — structural constant)"); continue
+        if verdict == "INCONCLUSIVE" or weight == 0.0:
+            reasoning.append(f"  {signal_name}: {verdict} (excluded from scoring)"); continue
+        effective = confidence * weight; total_weight += effective
+        if verdict == "LEANS_EXTERNAL":
+            external_score += effective
+            reasoning.append(f"  {signal_name}: {verdict} (conf={confidence:.2f}, weight={weight}) → +{effective:.2f} external")
+        elif verdict == "MIXED":
+            external_score += effective * 0.5
+            reasoning.append(f"  {signal_name}: {verdict} (conf={confidence:.2f}, weight={weight}) → +{effective*0.5:.2f} external (mixed)")
+        elif verdict == "LEANS_SYNTHETIC":
+            synthetic_score += effective
+            reasoning.append(f"  {signal_name}: {verdict} (conf={confidence:.2f}, weight={weight}) → +{effective:.2f} synthetic")
+        else:
+            reasoning.append(f"  {signal_name}: {verdict} (conf={confidence:.2f}, weight={weight}) → neutral")
+    if total_weight == 0:
+        return {
+            "composite_verdict": "INCONCLUSIVE", "composite_confidence": 0.0,
+            "external_score": 0.0, "synthetic_score": 0.0, "reasoning": reasoning,
+            "interpretation": "All signals inconclusive.",
+        }
+    ext_pct = external_score  / total_weight
+    syn_pct = synthetic_score / total_weight
+    if ext_pct > 0.6:
+        verdict = "LIKELY_EXTERNAL_PROXY"
+        interp  = ("Preponderance of evidence suggests the dominant user is a platform proxy "
+                   "routing genuine third-party API demand. Token variance, temporal distribution, "
+                   "function sequences, miner selection conformity, and request origin diversity "
+                   "are consistent with heterogeneous external usage. Definitive confirmation "
+                   "requires Chutes to publish anonymized API key diversity metrics.")
+    elif syn_pct > 0.6:
+        verdict = "LIKELY_SELF_CONSUMPTION"
+        interp  = ("Preponderance of evidence suggests internal or synthetic traffic.")
+    elif ext_pct > syn_pct:
+        verdict = "LEANS_EXTERNAL_INCONCLUSIVE"
+        interp  = "Signals lean toward external proxy routing but confidence is below threshold."
+    elif syn_pct > ext_pct:
+        verdict = "LEANS_SYNTHETIC_INCONCLUSIVE"
+        interp  = "Signals lean slightly toward self-consumption but confidence is low."
+    else:
+        verdict = "GENUINELY_AMBIGUOUS"
+        interp  = "Signals are evenly split. The E2EE ceiling is binding here."
+    return {
+        "composite_verdict":    verdict,
+        "composite_confidence": round(max(ext_pct, syn_pct), 3),
+        "external_score":       round(ext_pct, 3),
+        "synthetic_score":      round(syn_pct, 3),
+        "reasoning":            reasoning,
+        "interpretation":       interp,
+    }
+
+
+def run_perimeter_analysis(
+    user_agg: dict, chute_meta: dict, dominant_user_id: str,
+    perimeter: dict, date: str, output_dir: Path = OUTPUT_DIR,
+) -> dict:
+    print(f"\n{'='*100}")
+    print(f"  E2EE PERIMETER FORENSICS — DEMAND AUTHENTICITY ANALYSIS")
+    print(f"  Intelligence Sovereignty Research Suite | @im_perseverance")
+    print(f"{'='*100}")
+    dominant_data = user_agg.get(dominant_user_id, {})
+    if not dominant_data:
+        print(f"  Dominant user {dominant_user_id} not found."); return {}
+    signals = []
+    print(f"\n  Signal 1: Token Count Variance...")
+    sig1 = analyze_token_variance(perimeter.get("dominant_token_cv", {}))
+    signals.append(sig1); print(f"    → {sig1['verdict']} (conf={sig1.get('confidence',0):.2f})")
+    print(f"\n  Signal 2: Chute Age Analysis...")
+    sig2 = analyze_chute_age(dominant_data, chute_meta)
+    signals.append(sig2); print(f"    → {sig2['verdict']} (conf={sig2.get('confidence',0):.2f})")
+    print(f"\n  Signal 3: Miner Selection Entropy...")
+    sig3 = analyze_miner_selection_entropy(
+        perimeter["user_miner_counts"], perimeter["network_miner_shares"], dominant_user_id)
+    signals.append(sig3); print(f"    → {sig3['verdict']} (conf={sig3.get('confidence',0):.2f})")
+    print(f"\n  Signal 4: Inter-Arrival Time Distribution...")
+    sig4 = analyze_inter_arrival(perimeter["dominant_timestamps"])
+    signals.append(sig4); print(f"    → {sig4['verdict']} (conf={sig4.get('confidence',0):.2f})")
+    print(f"\n  Signal 5: Function Sequence Co-occurrence (full population)...")
+    sig5 = analyze_function_sequences(
+        perimeter["dominant_bigram_counts"],
+        perimeter["dominant_trigram_counts"],
+        perimeter["dominant_fn_totals"],
+    )
+    signals.append(sig5); print(f"    → {sig5['verdict']} (conf={sig5.get('confidence',0):.2f})")
+    print(f"\n  Signal 6: Image Owner Provenance — NOT_APPLICABLE (structural constant)")
+    sig6 = analyze_image_owner_structural(dominant_data)
+    signals.append(sig6); print(f"    → {sig6['verdict']}")
+    print(f"\n  Signal 7: Parent Invocation ID Diversity...")
+    sig7 = analyze_parent_invocation_diversity(
+        perimeter.get("dominant_inv_count", 0), perimeter.get("dominant_parent_ids", set()))
+    signals.append(sig7); print(f"    → {sig7['verdict']} (conf={sig7.get('confidence',0):.2f})")
+    print(f"\n  Signal 8: Instance ID Entropy (half weight)...")
+    sig8 = analyze_instance_entropy(
+        perimeter.get("dominant_instance_ids", set()),
+        perimeter.get("dominant_inv_count", 0),
+        perimeter.get("network_instance_counts", {}),
+    )
+    signals.append(sig8); print(f"    → {sig8['verdict']} (conf={sig8.get('confidence',0):.2f})")
+    composite = compute_composite_verdict(signals)
+    print(f"\n{'='*100}")
+    print(f"  COMPOSITE VERDICT")
+    print(f"{'-'*100}")
+    print(f"  Verdict    : {composite['composite_verdict']}")
+    print(f"  Confidence : {composite['composite_confidence']:.1%}")
+    print(f"  External   : {composite['external_score']:.1%}")
+    print(f"  Synthetic  : {composite['synthetic_score']:.1%}")
+    print(f"\n  SIGNAL REASONING:")
+    for line in composite["reasoning"]: print(f"  {line}")
+    print(f"\n  INTERPRETATION:")
+    words = composite["interpretation"].split(); line = "  "
+    for w in words:
+        if len(line) + len(w) + 1 > 95: print(line); line = "  " + w
+        else: line += " " + w if line.strip() else w
+    if line.strip(): print(line)
+    print(f"\n  E2EE CEILING: This analysis operates entirely on observable metadata.")
+    print(f"  Definitive confirmation requires Chutes to publish anonymized API key")
+    print(f"  diversity metrics or commission a third-party audit.")
+    print(f"{'='*100}\n")
+    report = {
+        "date": date, "dominant_user_id": dominant_user_id, "window_days": INVOCATION_WINDOW,
+        "signals": {
+            "token_variance": sig1, "chute_age": sig2, "miner_entropy": sig3,
+            "inter_arrival": sig4, "function_sequence": sig5, "image_owner": sig6,
+            "parent_invocation": sig7, "instance_entropy": sig8,
+        },
+        "composite": composite,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_file = output_dir / f"chutes_sn64_perimeter_{date}.json"
+    with open(report_file, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    print(f"  Perimeter report saved: {report_file}")
+    return report
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CORE ANALYSIS ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_analysis(root_tao_threshold: float, sn64_alpha_threshold: float):
 
     print(f"\n{SEPARATOR}")
     print(f"  SN64 CHUTES — INTELLIGENCE MARKET HYPOTHESIS TEST")
@@ -340,445 +1227,448 @@ def run_analysis(root_tao_threshold, sn64_alpha_threshold):
     now   = datetime.now(timezone.utc)
     ts    = now.strftime("%Y-%m-%d %H:%M:%S UTC")
     date  = now.strftime("%Y-%m-%d")
-
     print(f"  Snapshot block : {block:,}")
     print(f"  Snapshot time  : {ts}")
     print(f"  Analysis window: {INVOCATION_WINDOW} days")
 
     print(f"\nLoading SN{NETUID} metagraph...")
-    meta = sub.metagraph(NETUID)
-
+    meta            = sub.metagraph(NETUID)
     n_uids          = len(meta.uids)
     total_stake     = sum(float(s) for s in meta.stake)
     vali_uids       = [i for i, vp in enumerate(meta.validator_permit) if vp]
+    onchain         = {}
     total_incentive = sum(float(meta.incentive[i]) for i in range(n_uids))
     total_dividends = sum(float(meta.dividends[i]) for i in range(n_uids))
-
-    onchain = {}
     for uid in range(n_uids):
         hk        = meta.hotkeys[uid]
         stake     = float(meta.stake[uid])
         tao_equiv = float(meta.tao_stake[uid]) if hasattr(meta, 'tao_stake') else stake
-        incentive = float(meta.incentive[uid])
-        dividends = float(meta.dividends[uid])
+        incentive = float(meta.incentive[uid]); dividends = float(meta.dividends[uid])
         tv        = float(meta.validator_trust[uid]) if hasattr(meta, 'validator_trust') else 0.0
-        is_val    = uid in vali_uids
+        last_upd  = int(meta.last_update[uid])           if hasattr(meta, 'last_update')           else 0
         reg_block = int(meta.block_at_registration[uid]) if hasattr(meta, 'block_at_registration') else 0
-        last_upd  = int(meta.last_update[uid]) if hasattr(meta, 'last_update') else 0
-
         onchain[hk] = {
-            "uid":                 uid,
-            "hotkey":              hk,
-            "stake":               stake,
-            "tao_equiv":           tao_equiv,
-            "stake_pct":           stake / total_stake if total_stake > 0 else 0,
-            "incentive_pct":       incentive / total_incentive if total_incentive > 0 else 0,
-            "dividends_pct":       dividends / total_dividends if total_dividends > 0 else 0,
-            "tv":                  tv,
-            "is_validator":        is_val,
+            "uid": uid, "hotkey": hk, "stake": stake, "tao_equiv": tao_equiv,
+            "stake_pct":     stake / total_stake if total_stake > 0 else 0,
+            "incentive_pct": incentive / total_incentive if total_incentive > 0 else 0,
+            "dividends_pct": dividends / total_dividends if total_dividends > 0 else 0,
+            "tv": tv, "is_validator": uid in vali_uids, "last_update": last_upd,
+            "reg_block": reg_block,
             "age_blocks":          block - reg_block if reg_block > 0 else 0,
             "blocks_since_update": block - last_upd  if last_upd  > 0 else 0,
         }
-
     print(f"  SN64 UIDs: {n_uids} | Validators: {len(vali_uids)}")
 
     print(f"\nFetching SN{NETUID} alpha pool state...")
     pool = fetch_alpha_pool_state(sub, NETUID)
 
     print(f"\nFetching validator weight submissions for SN{NETUID}...")
-    weight_totals = defaultdict(float)
-    weight_counts = 0
+    weight_totals = defaultdict(float); weight_counts = 0
     for val_uid in vali_uids:
         try:
             weights = sub.get_neuron_for_pubkey_and_subnet(meta.hotkeys[val_uid], NETUID)
             if weights and hasattr(weights, 'weights') and weights.weights:
                 weight_counts += 1
-                for miner_uid, w in weights.weights:
-                    weight_totals[miner_uid] += float(w)
-        except Exception:
-            continue
+                for miner_uid, w in weights.weights: weight_totals[miner_uid] += float(w)
+        except Exception: continue
     total_weight = sum(weight_totals.values())
     print(f"  Validators with weight data: {weight_counts}/{len(vali_uids)}")
 
-    print("\nLoading Root metagraph (netuid=0)...")
-    root_meta   = sub.metagraph(0)
-    root_stakes = {}
-    for uid in range(len(root_meta.hotkeys)):
-        stake = float(root_meta.stake[uid])
-        if stake >= root_tao_threshold:
-            root_stakes[root_meta.hotkeys[uid]] = stake
-    print(f"  Root validators with {root_tao_threshold:,.0f}+ TAO: {len(root_stakes)}")
+    root_stakes = get_root_validator_stakes(sub)
 
     sn64_validators = []
     for hk, data in onchain.items():
         if data["is_validator"] and data["tao_equiv"] >= sn64_alpha_threshold:
             sn64_validators.append({
-                "hotkey":        hk,
-                "hotkey_short":  hk[:8] + "...",
-                "uid":           data["uid"],
-                "sn64_alpha":    data["stake"],
-                "tao_equiv":     data["tao_equiv"],
-                "tv":            data["tv"],
+                "hotkey": hk, "hotkey_short": hk[:8]+"...", "uid_sn64": data["uid"],
+                "sn64_alpha": data["stake"], "tao_equiv": data["tao_equiv"], "tv": data["tv"],
                 "dividends_pct": data["dividends_pct"],
+                "weight_share": weight_totals.get(data["uid"], 0) / total_weight if total_weight > 0 else 0,
             })
     sn64_validators.sort(key=lambda x: x["sn64_alpha"], reverse=True)
     print(f"\n  SN64 validators with {sn64_alpha_threshold:,.0f}+ alpha: {len(sn64_validators)}")
 
     overlap = []
     for hk, root_tao in root_stakes.items():
-        if hk in onchain and onchain[hk]["is_validator"] and onchain[hk]["tao_equiv"] >= sn64_alpha_threshold:
+        if hk in onchain and onchain[hk]["is_validator"]:
+            d = onchain[hk]
             overlap.append({
-                "hotkey":        hk,
-                "hotkey_short":  hk[:8] + "...",
-                "uid":           onchain[hk]["uid"],
-                "root_tao":      root_tao,
-                "sn64_alpha":    onchain[hk]["stake"],
-                "tv":            onchain[hk]["tv"],
-                "dividends_pct": onchain[hk]["dividends_pct"],
+                "hotkey": hk, "hotkey_short": hk[:8]+"...", "uid_sn64": d["uid"],
+                "root_tao": root_tao, "sn64_alpha": d["stake"], "tv": d["tv"],
+                "dividends_pct": d["dividends_pct"],
             })
     overlap.sort(key=lambda x: x["root_tao"], reverse=True)
-    print(f"  Root x SN64 overlap: {len(overlap)} validators")
+    print(f"  Root x SN64 overlap (any alpha): {len(overlap)} validators")
 
-    raw_agg, user_agg = fetch_invocation_exports(INVOCATION_WINDOW)
-    miner_demand      = aggregate_by_miner(raw_agg)
+    print(f"\nFetching Chutes invocation exports ({INVOCATION_WINDOW}-day window)...")
+    miner_demand, user_agg, perimeter, fields_info, all_chute_ids = fetch_all_data(INVOCATION_WINDOW)
+    if not miner_demand:
+        print("  No invocation data retrieved from api.chutes.ai"); return
 
     total_invocations = sum(m["invocation_count"] for m in miner_demand.values())
     total_compute     = sum(m["compute_seconds"]  for m in miner_demand.values())
+    tps_miners        = [m for m in miner_demand.values() if m["avg_tps"] > 0]
+    print(f"\n  Unique miners in invocation data: {len(miner_demand)}")
+    print(f"  Total invocations (7d): {total_invocations:,}")
+    print(f"  Total compute seconds (7d): {total_compute:,.0f}")
+    print(f"  Miners with native TPS: {len(tps_miners)}/{len(miner_demand)}")
 
     print("\nLoading previous snapshot for trend analysis...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     prev_snapshot = load_previous_snapshot(OUTPUT_DIR, date)
 
     print(f"\nMerging datasets on hotkey join key...")
-    merged  = []
-    matched = 0
-
+    merged = []; matched = 0; unmatched_demand = 0
     for hk in set(onchain.keys()) | set(miner_demand.keys()):
-        chain_data  = onchain.get(hk)
-        demand_data = miner_demand.get(hk)
-        if chain_data is None:
-            continue
-
+        chain_data  = onchain.get(hk); demand_data = miner_demand.get(hk)
+        if chain_data is None: unmatched_demand += 1; continue
         inv_count     = demand_data["invocation_count"] if demand_data else 0
         compute_sec   = demand_data["compute_seconds"]  if demand_data else 0.0
-        chute_div     = demand_data["chute_diversity"]  if demand_data else 0
-        inv_share     = inv_count / total_invocations   if total_invocations > 0 else 0
-        compute_share = compute_sec / total_compute     if total_compute > 0 else 0
+        chute_div     = demand_data["chute_diversity"]   if demand_data else 0
+        avg_tps       = demand_data["avg_tps"]           if demand_data else 0.0
+        avg_ttft      = demand_data["avg_ttft"]          if demand_data else 0.0
+        pass_rate     = demand_data["pass_rate"]         if demand_data else None
+        inv_share     = inv_count   / total_invocations  if total_invocations > 0 else 0
+        compute_share = compute_sec / total_compute      if total_compute     > 0 else 0
         uid           = chain_data["uid"]
         weight_share  = weight_totals.get(uid, 0) / total_weight if total_weight > 0 else 0
         emission_share = chain_data["incentive_pct"]
-
-        if demand_data:
-            matched += 1
-
+        if demand_data: matched += 1
         prev       = prev_snapshot.get(hk, {})
-        emit_trend = emission_share - prev.get("emission_share", emission_share) if prev else None
-        inv_trend  = inv_share - prev.get("invocation_share", inv_share) if prev else None
-
+        emit_trend = emission_share - prev.get("emission_share",   emission_share) if prev else None
+        inv_trend  = inv_share      - prev.get("invocation_share", inv_share)      if prev else None
         merged.append({
-            "hotkey":               hk,
-            "hotkey_short":         hk[:8] + "...",
-            "uid":                  uid,
-            "is_validator":         chain_data["is_validator"],
-            "tv":                   chain_data["tv"],
-            "age_blocks":           chain_data["age_blocks"],
-            "blocks_since_update":  chain_data["blocks_since_update"],
-            "invocation_count":     inv_count,
-            "compute_seconds":      round(compute_sec, 2),
-            "chute_diversity":      chute_div,
-            "seconds_per_invocation": 0.0,
-            "efficiency_tier":      "N/A",
-            "invocation_share":     inv_share,
-            "compute_share":        compute_share,
-            "weight_share":         weight_share,
-            "emission_share":       emission_share,
-            "dividends_share":      chain_data["dividends_pct"],
-            "stake_pct":            chain_data["stake_pct"],
-            "emission_trend":       round(emit_trend, 6) if emit_trend is not None else None,
-            "invocation_trend":     round(inv_trend, 6)  if inv_trend  is not None else None,
-            "delta_inv_emit":       emission_share - inv_share,
-            "delta_inv_weight":     weight_share - inv_share,
-            "quality_score":        0.0,
-            "delta_quality_weight": 0.0,
-            "delta_quality_emit":   0.0,
+            "hotkey": hk, "hotkey_short": hk[:8]+"...", "uid": uid,
+            "is_validator": chain_data["is_validator"], "tv": chain_data["tv"],
+            "age_blocks": chain_data["age_blocks"], "blocks_since_update": chain_data["blocks_since_update"],
+            "invocation_count": inv_count, "compute_seconds": round(compute_sec, 2),
+            "chute_diversity": chute_div, "avg_tps": avg_tps, "avg_ttft": avg_ttft, "pass_rate": pass_rate,
+            "seconds_per_invocation": 0.0, "efficiency_tier": "N/A",
+            "invocation_share": inv_share, "compute_share": compute_share,
+            "weight_share": weight_share, "emission_share": emission_share,
+            "dividends_share": chain_data["dividends_pct"], "stake_pct": chain_data["stake_pct"],
+            "emission_trend":   round(emit_trend, 6) if emit_trend is not None else None,
+            "invocation_trend": round(inv_trend,  6) if inv_trend  is not None else None,
+            "delta_inv_emit": emission_share - inv_share, "delta_inv_weight": weight_share - inv_share,
+            "quality_score": 0.0, "delta_quality_weight": 0.0, "delta_quality_emit": 0.0,
         })
-
-    print(f"  Matched (hotkey in both datasets): {matched}")
-    print(f"  On-chain only (no invocations): {len(merged) - matched}")
+    print(f"  Matched: {matched} | Unmatched demand: {unmatched_demand} | On-chain only: {len(merged)-matched}")
 
     merged = compute_quality_scores(merged)
-
-    miners_only = [m for m in merged if not m["is_validator"] and m["invocation_count"] > 0]
+    quality_miners = [m for m in merged if m["invocation_count"] > 0]
+    miners_only    = [m for m in merged if not m["is_validator"] and m["invocation_count"] > 0]
 
     def pearson(x, y):
         n = len(x)
         if n < 2: return None
-        mx, my = sum(x)/n, sum(y)/n
-        num = sum((xi-mx)*(yi-my) for xi, yi in zip(x, y))
-        dx  = sum((xi-mx)**2 for xi in x) ** 0.5
-        dy  = sum((yi-my)**2 for yi in y) ** 0.5
-        return num / (dx * dy) if dx * dy > 0 else None
+        mx = sum(x)/n; my = sum(y)/n
+        num = sum((xi-mx)*(yi-my) for xi,yi in zip(x,y))
+        dx  = (sum((xi-mx)**2 for xi in x))**0.5; dy = (sum((yi-my)**2 for yi in y))**0.5
+        return num/(dx*dy) if dx*dy > 0 else None
 
     def spearman(x, y):
         n = len(x)
         if n < 2: return None
-        rank_x = sorted(range(n), key=lambda i: x[i])
-        rank_y = sorted(range(n), key=lambda i: y[i])
-        rx, ry = [0]*n, [0]*n
-        for rank, idx in enumerate(rank_x): rx[idx] = rank
-        for rank, idx in enumerate(rank_y): ry[idx] = rank
+        rx_i = sorted(range(n), key=lambda i: x[i]); ry_i = sorted(range(n), key=lambda i: y[i])
+        rx = [0]*n; ry = [0]*n
+        for r, i in enumerate(rx_i): rx[i] = r
+        for r, i in enumerate(ry_i): ry[i] = r
         d_sq = sum((rx[i]-ry[i])**2 for i in range(n))
-        return 1 - (6*d_sq) / (n*(n**2-1))
+        return 1 - (6*d_sq)/(n*(n**2-1))
 
     r_inv_emit = r_inv_wt = rs_inv_emit = rs_inv_wt = None
+    r_top = r_mid = r_tail = None; top_cut = tail_cut = 0
     r_qs_wt = r_qs_emi = rs_qs_wt = rs_qs_emi = None
 
     if len(miners_only) >= 2:
-        inv_shares  = [m["invocation_share"] for m in miners_only]
-        emit_shares = [m["emission_share"]    for m in miners_only]
-        wt_shares   = [m["weight_share"]      for m in miners_only]
-        r_inv_emit  = pearson(inv_shares, emit_shares)
-        r_inv_wt    = pearson(inv_shares, wt_shares)
-        rs_inv_emit = spearman(inv_shares, emit_shares)
-        rs_inv_wt   = spearman(inv_shares, wt_shares)
+        inv_s = [m["invocation_share"] for m in miners_only]
+        emit_s = [m["emission_share"] for m in miners_only]
+        wt_s   = [m["weight_share"]   for m in miners_only]
+        r_inv_emit  = pearson(inv_s, emit_s);  r_inv_wt    = pearson(inv_s, wt_s)
+        rs_inv_emit = spearman(inv_s, emit_s); rs_inv_wt   = spearman(inv_s, wt_s)
+        n = len(miners_only); top_cut = max(1, n//5); tail_cut = max(1, n*4//5)
+        by_inv = sorted(miners_only, key=lambda m: m["invocation_share"], reverse=True)
+        def tp(group):
+            if len(group) < 2: return None
+            return pearson([m["invocation_share"] for m in group], [m["emission_share"] for m in group])
+        r_top = tp(by_inv[:top_cut]); r_mid = tp(by_inv[top_cut:tail_cut]); r_tail = tp(by_inv[tail_cut:])
 
-    quality_miners = [m for m in merged if m["invocation_count"] > 0]
-    if len(quality_miners) >= 2:
-        qs_shares  = [m["quality_score"]  for m in quality_miners]
-        wt_shares  = [m["weight_share"]   for m in quality_miners]
-        emi_shares = [m["emission_share"] for m in quality_miners]
-        r_qs_wt    = pearson(qs_shares, wt_shares)
-        r_qs_emi   = pearson(qs_shares, emi_shares)
-        rs_qs_wt   = spearman(qs_shares, wt_shares)
-        rs_qs_emi  = spearman(qs_shares, emi_shares)
-
-    # ── Print Report ───────────────────────────────────────────────────────────
+    # ── Console Report ────────────────────────────────────────────────────────
 
     print(f"\n\n{SEPARATOR}")
-    print(f"  SNAPSHOT METADATA")
-    print(THIN_SEP)
-    print(f"  Block          : {block:,}")
-    print(f"  Timestamp      : {ts}")
+    print(f"  SNAPSHOT METADATA"); print(THIN_SEP)
+    print(f"  Block          : {block:,}"); print(f"  Timestamp      : {ts}")
     print(f"  Analysis window: {INVOCATION_WINDOW} days")
-    print(f"  Data sources   : api.chutes.ai (invocations) + Bittensor finney (metagraph)")
+    print(f"  Data sources   : api.chutes.ai (invocations + metrics) + Bittensor finney (metagraph)")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  ALPHA TOKEN POOL — SN64 (aCHUTES)")
-    print(THIN_SEP)
+    print(f"\n{SEPARATOR}"); print(f"  ALPHA TOKEN POOL — SN64 (aCHUTES)"); print(THIN_SEP)
     if pool["alpha_price"] is None:
         print(f"  Pool state unavailable.")
     else:
-        print(f"  Spot price (alpha -> TAO)  : {pool['alpha_price']:.4f} TAO")
-        if pool["ema_price"]:
-            print(f"  EMA price (protocol)      : {pool['ema_price']:.4f} TAO")
-        if pool["spot_ema_gap_pct"] is not None:
-            gap_pct = pool["spot_ema_gap_pct"]
-            sign    = "+" if gap_pct >= 0 else ""
-            label   = "spot ABOVE ema" if gap_pct >= 0 else "spot BELOW ema"
-            print(f"  Spot vs EMA gap           : {sign}{gap_pct:.1f}%  [{label}]")
-        if pool["tao_reserves"]:
-            print(f"  TAO reserves (pool depth) : {fmt_large(pool['tao_reserves'])} TAO")
-        if pool["market_cap_tao"]:
-            print(f"  Implied market cap        : {fmt_large(pool['market_cap_tao'])} TAO")
+        print(f"  Spot price (alpha -> TAO)  : {fmt_tao(pool['alpha_price'])}")
+        if pool["ema_price"]: print(f"  EMA price (protocol)      : {fmt_tao(pool['ema_price'])}")
+        if pool["spot_ema_gap"] is not None:
+            gap = pool["spot_ema_gap"]; pct = pool["spot_ema_gap_pct"]
+            sign = "+" if gap >= 0 else ""; label = "spot ABOVE ema" if gap >= 0 else "spot BELOW ema"
+            print(f"  Spot vs EMA gap           : {sign}{gap:.4f} TAO  ({sign}{pct:.1f}%)  [{label}]")
+            if pct > 20:    print(f"  SPOT PREMIUM >20%: nominators entering now buy above EMA yield basis.")
+            elif pct < -20: print(f"  SPOT DISCOUNT >20%: alpha trading below EMA — potential entry advantage.")
+            else:           print(f"  -> Spot/EMA within 20% band.")
+        if pool["tao_reserves"]:      print(f"  TAO reserves (pool depth) : {fmt_large(pool['tao_reserves'])} TAO")
+        if pool["alpha_in_pool"]:     print(f"  Alpha in pool (AMM)       : {fmt_large(pool['alpha_in_pool'])} aCHUTES")
+        if pool["alpha_outstanding"]: print(f"  Alpha outstanding         : {fmt_large(pool['alpha_outstanding'])} aCHUTES")
+        if pool["market_cap_tao"]:    print(f"  Implied market cap        : {fmt_large(pool['market_cap_tao'])} TAO")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  DEMAND SIGNAL — TOP 20 MINERS BY INVOCATION SHARE (7d)")
-    print(THIN_SEP)
-    print(f"  {'Rank':>4}  {'UID':>4}  {'Hotkey':10}  {'Invocations':>12}  {'Inv Share':>10}  {'Compute Share':>13}  {'Chute Div':>9}  {'Emission Share':>14}")
-    print(THIN_SEP)
+    print(f"\n{SEPARATOR}"); print(f"  DEMAND SIGNAL — TOP 20 MINERS BY INVOCATION SHARE (7d)"); print(THIN_SEP)
+    print(f"  {'Rank':>4}  {'UID':>4}  {'Hotkey':10}  {'Invocations':>12}  {'Inv%':>8}  "
+          f"{'Cmp%':>8}  {'Div':>5}  {'TPS':>7}  {'Pass':>6}  {'Emit%':>8}"); print(THIN_SEP)
     for rank, m in enumerate(sorted(merged, key=lambda x: x["invocation_share"], reverse=True)[:20], 1):
-        print(f"  {rank:>4}  {m['uid']:>4}  {m['hotkey_short']:10}  "
-              f"{m['invocation_count']:>12,}  {fmt_pct(m['invocation_share']):>10}  "
-              f"{fmt_pct(m['compute_share']):>13}  {m['chute_diversity']:>9}  "
-              f"{fmt_pct(m['emission_share']):>14}")
+        tps = f"{m['avg_tps']:.1f}" if m.get("avg_tps", 0) > 0 else "  N/A"
+        pr  = f"{m['pass_rate']*100:.0f}%" if m.get("pass_rate") is not None else "  N/A"
+        print(f"  {rank:>4}  {m['uid']:>4}  {m['hotkey_short']:10}  {m['invocation_count']:>12,}  "
+              f"{fmt_pct(m['invocation_share']):>8}  {fmt_pct(m['compute_share']):>8}  "
+              f"{m['chute_diversity']:>5}  {tps:>7}  {pr:>6}  {fmt_pct(m['emission_share']):>8}")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  RECOGNITION — TOP 20 MINERS BY EMISSION SHARE")
-    print(THIN_SEP)
-    print(f"  {'Rank':>4}  {'UID':>4}  {'Hotkey':10}  {'Emission Share':>14}  {'Inv Share':>10}  {'Weight Share':>12}  {'Delta (E-D)':>12}")
-    print(THIN_SEP)
+    print(f"\n{SEPARATOR}"); print(f"  RECOGNITION — TOP 20 MINERS BY EMISSION SHARE"); print(THIN_SEP)
+    print(f"  {'Rank':>4}  {'UID':>4}  {'Hotkey':10}  {'Emit%':>8}  {'Inv%':>8}  "
+          f"{'Wgt%':>8}  {'Delta':>10}"); print(THIN_SEP)
     for rank, m in enumerate(sorted(merged, key=lambda x: x["emission_share"], reverse=True)[:20], 1):
         print(f"  {rank:>4}  {m['uid']:>4}  {m['hotkey_short']:10}  "
-              f"{fmt_pct(m['emission_share']):>14}  {fmt_pct(m['invocation_share']):>10}  "
-              f"{fmt_pct(m['weight_share']):>12}  "
-              f"{fmt_delta(m['invocation_share'], m['emission_share']):>12}")
+              f"{fmt_pct(m['emission_share']):>8}  {fmt_pct(m['invocation_share']):>8}  "
+              f"{fmt_pct(m['weight_share']):>8}  "
+              f"{fmt_delta(m['invocation_share'], m['emission_share']):>10}")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  DIVERGENCE TABLE — TOP 20 LARGEST DEMAND vs EMISSION GAP")
-    print(THIN_SEP)
-    print(f"  {'Rank':>4}  {'UID':>4}  {'Hotkey':10}  {'Inv Share':>10}  {'Emission Share':>14}  {'Delta (pp)':>12}  {'Weight Share':>12}")
-    print(THIN_SEP)
-    for rank, m in enumerate(sorted([m for m in merged if m["invocation_count"] > 0],
-                                     key=lambda x: abs(x["delta_inv_emit"]), reverse=True)[:20], 1):
+    print(f"\n{SEPARATOR}"); print(f"  DIVERGENCE TABLE — TOP 20 DEMAND vs EMISSION GAP"); print(THIN_SEP)
+    print(f"  {'Rank':>4}  {'UID':>4}  {'Hotkey':10}  {'Inv%':>8}  {'Emit%':>8}  "
+          f"{'Delta':>10}  {'Wgt%':>8}"); print(THIN_SEP)
+    for rank, m in enumerate(
+        sorted([m for m in merged if m["invocation_count"] > 0],
+               key=lambda x: abs(x["delta_inv_emit"]), reverse=True)[:20], 1):
         print(f"  {rank:>4}  {m['uid']:>4}  {m['hotkey_short']:10}  "
-              f"{fmt_pct(m['invocation_share']):>10}  {fmt_pct(m['emission_share']):>14}  "
-              f"{fmt_delta(m['invocation_share'], m['emission_share']):>12}  "
-              f"{fmt_pct(m['weight_share']):>12}")
+              f"{fmt_pct(m['invocation_share']):>8}  {fmt_pct(m['emission_share']):>8}  "
+              f"{fmt_delta(m['invocation_share'], m['emission_share']):>10}  "
+              f"{fmt_pct(m['weight_share']):>8}")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  CORRELATION ANALYSIS — DEMAND vs RECOGNITION")
-    print(THIN_SEP)
-    print(f"  Miners with invocation data : {len(miners_only)}")
+    print(f"\n{SEPARATOR}"); print(f"  CORRELATION ANALYSIS — DEMAND vs RECOGNITION"); print(THIN_SEP)
+    print(f"  Miners with invocation data: {len(miners_only)}")
     if r_inv_emit is not None:
-        strength_p  = "STRONG" if abs(r_inv_emit)  > 0.7 else "MODERATE" if abs(r_inv_emit)  > 0.4 else "WEAK"
-        strength_rs = "STRONG" if abs(rs_inv_emit) > 0.7 else "MODERATE" if abs(rs_inv_emit) > 0.4 else "WEAK"
-        print(f"  Pearson  r  (inv -> emission) : {r_inv_emit:+.4f}  [{strength_p}]")
-        print(f"  Spearman rho (inv -> emission) : {rs_inv_emit:+.4f}  [{strength_rs}]")
+        sp = "STRONG" if abs(r_inv_emit) > 0.7 else "MODERATE" if abs(r_inv_emit) > 0.4 else "WEAK"
+        ss = "STRONG" if abs(rs_inv_emit) > 0.7 else "MODERATE" if abs(rs_inv_emit) > 0.4 else "WEAK"
+        print(f"  Pearson  r  (inv -> emission) : {r_inv_emit:+.4f}  [{sp}]")
+        print(f"  Spearman rho (inv -> emission) : {rs_inv_emit:+.4f}  [{ss}]")
         if r_inv_wt:  print(f"  Pearson  r  (inv -> weight)   : {r_inv_wt:+.4f}")
         if rs_inv_wt: print(f"  Spearman rho (inv -> weight)   : {rs_inv_wt:+.4f}")
-        lead = rs_inv_emit if rs_inv_emit is not None else r_inv_emit
         print()
-        if lead > 0.7:
-            print(f"  -> STRONG correlation. Validators reward miners proportional to real demand.")
-            print(f"     Evidence supports: Bittensor functions as a market for intelligence on SN64.")
-        elif lead > 0.4:
-            print(f"  -> MODERATE correlation. General alignment exists but divergences are material.")
-        else:
-            print(f"  -> WEAK correlation. Emission distribution diverges from invocation demand.")
-        if r_inv_emit and rs_inv_emit and abs(r_inv_emit - rs_inv_emit) > 0.15:
-            print(f"\n  Pearson/Spearman gap suggests power-law distribution.")
-            print(f"  Spearman is the more reliable measure for this dataset.")
+        if r_top  is not None: print(f"  Tier corr — Top  ({top_cut} miners) : {r_top:+.4f}")
+        if r_mid  is not None: print(f"  Tier corr — Mid               : {r_mid:+.4f}")
+        if r_tail is not None: print(f"  Tier corr — Tail              : {r_tail:+.4f}")
+        print()
+        lead = rs_inv_emit if rs_inv_emit is not None else r_inv_emit
+        if lead > 0.7:   print(f"  -> STRONG: validators reward miners proportional to real demand.\n     Evidence supports: Bittensor functions as a market for intelligence on SN64.")
+        elif lead > 0.4: print(f"  -> MODERATE: general alignment but divergences are material.")
+        else:            print(f"  -> WEAK: emission distribution diverges significantly from demand.")
+    else:
+        print(f"  Insufficient data for correlation.")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  QUALITY CROSSCHECK — INDEPENDENT SCORE vs VALIDATOR WEIGHTS")
-    print(f"  Our score = {QUALITY_WEIGHT_COMPUTE*100:.0f}% compute + {QUALITY_WEIGHT_INVOCATION*100:.0f}% invocations + {QUALITY_WEIGHT_DIVERSITY*100:.0f}% diversity + {QUALITY_WEIGHT_EFFICIENCY*100:.0f}% efficiency")
-    print(THIN_SEP)
-    if r_qs_wt is not None:
-        print(f"  Pearson  r  (quality -> weight)   : {r_qs_wt:+.4f}")
-        print(f"  Spearman rho (quality -> weight)   : {rs_qs_wt:+.4f}")
-        print(f"  Pearson  r  (quality -> emission) : {r_qs_emi:+.4f}")
-        print(f"  Spearman rho (quality -> emission) : {rs_qs_emi:+.4f}")
+    print(f"\n{SEPARATOR}"); print(f"  QUALITY CROSSCHECK — INDEPENDENT SCORE vs VALIDATOR WEIGHTS"); print(THIN_SEP)
+    if quality_miners:
+        qs_s = [m["quality_score"] for m in quality_miners]
+        wt_s = [m["weight_share"]  for m in quality_miners]
+        emi_s = [m["emission_share"] for m in quality_miners]
+        r_qs_wt   = pearson(qs_s, wt_s);   r_qs_emi  = pearson(qs_s, emi_s)
+        rs_qs_wt  = spearman(qs_s, wt_s);  rs_qs_emi = spearman(qs_s, emi_s)
+        if r_qs_wt:   print(f"  Pearson  r  (quality -> weight)   : {r_qs_wt:+.4f}")
+        if rs_qs_wt:  print(f"  Spearman rho (quality -> weight)   : {rs_qs_wt:+.4f}")
+        if r_qs_emi:  print(f"  Pearson  r  (quality -> emission) : {r_qs_emi:+.4f}")
+        if rs_qs_emi: print(f"  Spearman rho (quality -> emission) : {rs_qs_emi:+.4f}")
+        print(f"  Miners with native TPS: {len(tps_miners)}/{len(quality_miners)}")
+        print(f"\n  TOP QUALITY-WEIGHT DIVERGENCES"); print(THIN_SEP)
+        print(f"  {'UID':>4}  {'QS%':>7}  {'Wgt%':>7}  {'DeltaQW':>9}  "
+              f"{'Inv%':>7}  {'TPS':>6}  {'Pass':>6}  {'Div':>5}"); print(THIN_SEP)
+        for m in sorted(quality_miners, key=lambda m: abs(m["delta_quality_weight"]), reverse=True)[:10]:
+            dqw  = m["delta_quality_weight"]; sign = "+" if dqw >= 0 else ""
+            tps  = f"{m['avg_tps']:.1f}"      if m.get("avg_tps",   0)   > 0   else "  N/A"
+            pr   = f"{m['pass_rate']*100:.0f}%" if m.get("pass_rate") is not None else "  N/A"
+            print(f"  {m['uid']:>4}  {fmt_pct(m['quality_score']):>7}  "
+                  f"{fmt_pct(m['weight_share']):>7}  {sign}{dqw*100:.2f}pp  "
+                  f"{fmt_pct(m['invocation_share']):>7}  {tps:>6}  {pr:>6}  {m['chute_diversity']:>5}")
+        if r_qs_wt:
+            print()
+            if r_qs_wt > 0.7:   print(f"  -> Strong agreement (r={r_qs_wt:.3f}).")
+            elif r_qs_wt > 0.4: print(f"  -> Moderate correlation (r={r_qs_wt:.3f}).")
+            else:               print(f"  -> Weak correlation (r={r_qs_wt:.3f}).")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  DEMAND-SIDE USER ANALYSIS")
-    print(THIN_SEP)
+    dominant_report = None; perimeter_report = None; chute_meta = {}
     if user_agg:
+        print(f"\n{SEPARATOR}"); print(f"  DEMAND-SIDE USER ANALYSIS — WHO IS CONSUMING SN64 COMPUTE (7d)"); print(THIN_SEP)
         users_sorted = sorted(user_agg.values(), key=lambda u: u["invocation_count"], reverse=True)
-        top1_share   = users_sorted[0]["inv_share"] if users_sorted else 0
-        top3_share   = sum(u["inv_share"] for u in users_sorted[:3])
-        top5_share   = sum(u["inv_share"] for u in users_sorted[:5])
+        top1  = users_sorted[0]["inv_share"] if users_sorted else 0
+        top3  = sum(u["inv_share"] for u in users_sorted[:3])
+        top5  = sum(u["inv_share"] for u in users_sorted[:5])
+        top10 = sum(u["inv_share"] for u in users_sorted[:10])
+        def gini_fn(values):
+            vals = sorted([v for v in values if v > 0]); n = len(vals)
+            if n == 0: return None
+            total = sum(vals)
+            return (2 * sum((i+1)*v for i,v in enumerate(vals))) / (n*total) - (n+1)/n
+        gu = gini_fn([u["invocation_count"] for u in users_sorted])
         print(f"  Total unique users (7d)      : {len(users_sorted):,}")
-        print(f"  Top-1  user invocation share : {top1_share*100:.2f}%")
-        print(f"  Top-3  user invocation share : {top3_share*100:.2f}%")
-        print(f"  Top-5  user invocation share : {top5_share*100:.2f}%")
-        print(f"\n  {'Rank':>4}  {'User ID (truncated)':35}  {'Invocations':>12}  {'Inv Share':>10}  {'Unique Chutes':>14}")
-        print(THIN_SEP)
+        print(f"  Top-1  user invocation share : {top1*100:.2f}%")
+        print(f"  Top-3  user invocation share : {top3*100:.2f}%")
+        print(f"  Top-5  user invocation share : {top5*100:.2f}%")
+        print(f"  Top-10 user invocation share : {top10*100:.2f}%")
+        if gu is not None:
+            print(f"  Gini (user distribution)     : {gu:.4f}")
+            if gu > 0.7:   print(f"  HIGH CONCENTRATION: demand driven by a small number of power users")
+            elif gu > 0.5: print(f"  MODERATE CONCENTRATION: mixed demand base")
+            else:          print(f"  DISTRIBUTED: demand spread across many users")
+        print(f"\n  TOP 20 USERS BY INVOCATION VOLUME"); print(THIN_SEP)
+        print(f"  {'Rank':>4}  {'User ID (truncated)':35}  {'Invocations':>12}  "
+              f"{'Inv%':>8}  {'Cmp%':>8}  {'Chutes':>7}  {'Parents':>10}  {'Instances':>10}"); print(THIN_SEP)
         for rank, u in enumerate(users_sorted[:20], 1):
-            uid_display = u["user_id"][:33] + ".." if len(u["user_id"]) > 35 else u["user_id"]
-            print(f"  {rank:>4}  {uid_display:35}  {u['invocation_count']:>12,}  "
-                  f"{fmt_pct(u['inv_share']):>10}  {u['chute_count']:>14,}")
+            uid_d     = u["user_id"][:33]+".." if len(u["user_id"]) > 35 else u["user_id"]
+            parents   = len(u.get("parent_ids",   set()))
+            instances = len(u.get("instance_ids", set()))
+            print(f"  {rank:>4}  {uid_d:35}  {u['invocation_count']:>12,}  "
+                  f"{fmt_pct(u['inv_share']):>8}  {fmt_pct(u['compute_share']):>8}  "
+                  f"{u['chute_count']:>7}  {parents:>10,}  {instances:>10,}")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  SN64 VALIDATORS (TAO-equivalent stake >= {sn64_alpha_threshold:,.0f})")
-    print(THIN_SEP)
-    print(f"  {'Rank':>4}  {'Hotkey':10}  {'UID':>4}  {'Alpha Stake':>12}  {'TAO Equiv':>10}  {'Tv':>6}  {'Div Share':>10}")
-    print(THIN_SEP)
-    for rank, v in enumerate(sn64_validators, 1):
-        print(f"  {rank:>4}  {v['hotkey_short']:10}  {v['uid']:>4}  "
-              f"{v['sn64_alpha']:>12,.0f}  {v['tao_equiv']:>10,.0f}  "
-              f"{v['tv']:>6.4f}  {fmt_pct(v['dividends_pct']):>10}")
+        dominant = users_sorted[0]
+        if dominant["inv_share"] > 0.50:
+            print(f"\n  Top user holds {dominant['inv_share']*100:.1f}% — running deep analysis...")
+            chute_meta      = fetch_chute_metadata(dominant["chute_ids"])
+            dominant_report = analyze_dominant_user(dominant, chute_meta, date)
+            perimeter       = populate_perimeter_dominant(perimeter, user_agg, dominant["user_id"])
+            perimeter_report = run_perimeter_analysis(
+                user_agg=user_agg, chute_meta=chute_meta,
+                dominant_user_id=dominant["user_id"],
+                perimeter=perimeter, date=date, output_dir=OUTPUT_DIR,
+            )
+        else:
+            print(f"\n  No dominant user (top {dominant['inv_share']*100:.1f}%) — skipping deep analysis.")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  ROOT x SN64 VALIDATOR OVERLAP")
-    print(f"  Root stake >= {root_tao_threshold:,.0f} TAO  AND  SN64 stake >= {sn64_alpha_threshold:,.0f} alpha")
-    print(THIN_SEP)
-    for rank, v in enumerate(overlap, 1):
-        print(f"  {rank:>4}  {v['hotkey_short']:10}  UID {v['uid']:>4}  "
-              f"Root: {v['root_tao']:>10,.0f} TAO  |  SN64: {v['sn64_alpha']:>10,.0f} alpha  |  "
-              f"Tv: {v['tv']:.4f}  |  Div: {fmt_pct(v['dividends_pct'])}")
+    print(f"\n{SEPARATOR}"); print(f"  SN64 VALIDATORS (TAO-equivalent stake >= {sn64_alpha_threshold:,.0f})"); print(THIN_SEP)
+    if sn64_validators:
+        print(f"  {'Rank':>4}  {'Hotkey':10}  {'UID':>4}  {'Alpha':>12}  "
+              f"{'TAO':>10}  {'Tv':>6}  {'Div%':>8}  {'Wgt%':>8}"); print(THIN_SEP)
+        for rank, v in enumerate(sn64_validators, 1):
+            print(f"  {rank:>4}  {v['hotkey_short']:10}  {v['uid_sn64']:>4}  "
+                  f"{v['sn64_alpha']:>12,.0f}  {v['tao_equiv']:>10,.0f}  {v['tv']:>6.4f}  "
+                  f"{fmt_pct(v['dividends_pct']):>8}  {fmt_pct(v['weight_share']):>8}")
 
-    print(f"\n{SEPARATOR}")
-    print(f"  MINER INCENTIVE CONCENTRATION")
-    print(THIN_SEP)
-    miners_sorted = sorted([m for m in merged if not m["is_validator"]],
-                           key=lambda x: x["emission_share"], reverse=True)
-    top1  = miners_sorted[0]["emission_share"] if miners_sorted else 0
-    top3  = sum(m["emission_share"] for m in miners_sorted[:3])
-    top5  = sum(m["emission_share"] for m in miners_sorted[:5])
-    top10 = sum(m["emission_share"] for m in miners_sorted[:10])
+    print(f"\n{SEPARATOR}"); print(f"  ROOT x SN64 VALIDATOR OVERLAP"); print(THIN_SEP)
+    if overlap:
+        print(f"  {'Rank':>4}  {'Hotkey':10}  {'UID':>4}  {'Root TAO':>12}  "
+              f"{'SN64 Alpha':>12}  {'Tv':>6}  {'Div%':>8}"); print(THIN_SEP)
+        for rank, v in enumerate(overlap, 1):
+            print(f"  {rank:>4}  {v['hotkey_short']:10}  {v['uid_sn64']:>4}  "
+                  f"{v['root_tao']:>12,.0f}  {v['sn64_alpha']:>12,.0f}  "
+                  f"{v['tv']:>6.4f}  {fmt_pct(v['dividends_pct']):>8}")
 
+    print(f"\n{SEPARATOR}"); print(f"  MINER INCENTIVE CONCENTRATION"); print(THIN_SEP)
+    miners_s = sorted([m for m in merged if not m["is_validator"]],
+                      key=lambda x: x["emission_share"], reverse=True)
+    t1  = miners_s[0]["emission_share"] if miners_s else 0
+    t3  = sum(m["emission_share"] for m in miners_s[:3])
+    t5  = sum(m["emission_share"] for m in miners_s[:5])
+    t10 = sum(m["emission_share"] for m in miners_s[:10])
     def gini(values):
-        vals = sorted([v for v in values if v > 0])
-        n    = len(vals)
+        vals = sorted([v for v in values if v > 0]); n = len(vals)
         if n == 0: return None
         total = sum(vals)
-        if total == 0: return None
-        return (2 * sum((i+1)*v for i, v in enumerate(vals))) / (n*total) - (n+1)/n
-
-    gini_active = gini([m["emission_share"] for m in miners_sorted if m["emission_share"] > 0])
-    print(f"  Top-1  miner emission share : {top1*100:.2f}%")
-    print(f"  Top-3  miner emission share : {top3*100:.2f}%")
-    print(f"  Top-5  miner emission share : {top5*100:.2f}%")
-    print(f"  Top-10 miner emission share : {top10*100:.2f}%")
-    if gini_active: print(f"  Gini (active miners only)   : {gini_active:.4f}")
-
+        return (2 * sum((i+1)*v for i,v in enumerate(vals))) / (n*total) - (n+1)/n
+    ga  = gini([m["emission_share"] for m in miners_s])
+    gac = gini([m["emission_share"] for m in miners_s if m["emission_share"] > 0])
+    print(f"  Top-1  : {t1*100:.2f}% | Top-3  : {t3*100:.2f}% | "
+          f"Top-5  : {t5*100:.2f}% | Top-10 : {t10*100:.2f}%")
+    if ga:  print(f"  Gini (all miners)    : {ga:.4f}")
+    if gac: print(f"  Gini (active only)   : {gac:.4f}")
+    print()
+    if gac:
+        if gac > 0.7:   print(f"  HIGH CONCENTRATION: Gini={gac:.3f}")
+        elif gac > 0.5: print(f"  MODERATE CONCENTRATION: Gini={gac:.3f}")
+        else:           print(f"  DISTRIBUTED: Gini={gac:.3f}")
+    if t1 > 0.30:   print(f"\n  DOMINANT MINER: Top-1 controls {t1*100:.1f}% of miner emissions")
+    elif t1 > 0.15: print(f"\n  ELEVATED CONCENTRATION: Top-1 at {t1*100:.1f}%")
     print(f"\n{SEPARATOR}\n")
 
-    # ── Save Outputs ───────────────────────────────────────────────────────────
+    # ── Save Outputs ──────────────────────────────────────────────────────────
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     merged_file = OUTPUT_DIR / f"chutes_sn64_analysis_{date}.csv"
     fieldnames  = [
         "hotkey", "uid", "is_validator", "tv", "age_blocks", "blocks_since_update",
         "invocation_count", "compute_seconds", "chute_diversity",
-        "seconds_per_invocation", "efficiency_tier",
-        "invocation_share", "compute_share", "weight_share",
-        "emission_share", "dividends_share", "stake_pct",
-        "emission_trend", "invocation_trend",
+        "avg_tps", "avg_ttft", "pass_rate", "seconds_per_invocation", "efficiency_tier",
+        "invocation_share", "compute_share", "weight_share", "emission_share",
+        "dividends_share", "stake_pct", "emission_trend", "invocation_trend",
         "quality_score", "delta_inv_emit", "delta_inv_weight",
-        "delta_quality_weight", "delta_quality_emit"
+        "delta_quality_weight", "delta_quality_emit",
     ]
     with open(merged_file, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(merged)
+        writer.writeheader(); writer.writerows(merged)
 
     div_file = OUTPUT_DIR / f"chutes_sn64_divergence_{date}.csv"
     with open(div_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["hotkey","uid","invocation_share","emission_share","delta_inv_emit","weight_share","chute_diversity"], extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=[
+            "hotkey", "uid", "invocation_share", "emission_share", "delta_inv_emit",
+            "weight_share", "chute_diversity", "avg_tps", "pass_rate",
+        ], extrasaction="ignore")
         writer.writeheader()
         writer.writerows(sorted(merged, key=lambda x: abs(x["delta_inv_emit"]), reverse=True))
 
     meta_file = OUTPUT_DIR / f"chutes_sn64_metadata_{date}.json"
     with open(meta_file, "w") as f:
         json.dump({
-            "block": block, "timestamp": ts, "netuid": NETUID,
-            "window_days": INVOCATION_WINDOW,
-            "total_invocations": total_invocations,
-            "total_compute_sec": total_compute,
-            "n_miners_demand": len(miner_demand),
-            "n_matched": matched,
-            "n_overlap": len(overlap),
-            "n_sn64_validators": len(sn64_validators),
-            "n_demand_users": len(user_agg),
+            "block": block, "timestamp": ts, "netuid": NETUID, "window_days": INVOCATION_WINDOW,
+            "total_invocations": total_invocations, "total_compute_sec": total_compute,
+            "n_miners_demand": len(miner_demand), "n_matched": matched,
+            "n_overlap": len(overlap), "n_sn64_validators": len(sn64_validators),
+            "n_demand_users": len(user_agg), "n_miners_native_tps": len(tps_miners),
             "r_inv_emit": r_inv_emit, "r_inv_weight": r_inv_wt,
             "rs_inv_emit": rs_inv_emit, "rs_inv_weight": rs_inv_wt,
+            "r_top_tier": r_top, "r_mid_tier": r_mid, "r_tail_tier": r_tail,
             "r_quality_weight": r_qs_wt, "r_quality_emit": r_qs_emi,
             "rs_quality_weight": rs_qs_wt, "rs_quality_emit": rs_qs_emi,
-            "gini_active_miners": gini_active,
+            "top1_miner_emission_share": miners_s[0]["emission_share"] if miners_s else None,
+            "gini_all_miners": ga, "gini_active_miners": gac,
+            "root_tao_threshold": ROOT_TAO_THRESHOLD, "sn64_alpha_threshold": SN64_ALPHA_THRESHOLD,
             "alpha_price": pool["alpha_price"], "ema_price": pool["ema_price"],
-            "tao_reserves": pool["tao_reserves"], "market_cap_tao": pool["market_cap_tao"],
+            "spot_ema_gap": pool["spot_ema_gap"], "spot_ema_gap_pct": pool["spot_ema_gap_pct"],
+            "tao_reserves": pool["tao_reserves"], "alpha_outstanding": pool["alpha_outstanding"],
+            "alpha_in_pool": pool["alpha_in_pool"], "market_cap_tao": pool["market_cap_tao"],
         }, f, indent=2)
 
-    user_file = OUTPUT_DIR / f"chutes_sn64_demand_users_{date}.csv"
-    with open(user_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["user_id","invocation_count","compute_seconds","chute_count","inv_share","compute_share"], extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(sorted(user_agg.values(), key=lambda u: u["invocation_count"], reverse=True))
+    if user_agg:
+        user_file = OUTPUT_DIR / f"chutes_sn64_demand_users_{date}.csv"
+        with open(user_file, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "user_id", "invocation_count", "compute_seconds", "chute_count",
+                "inv_share", "compute_share",
+            ], extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(sorted(user_agg.values(), key=lambda u: u["invocation_count"], reverse=True))
+        print(f"  {user_file.name}")
+
+    if dominant_report is not None:
+        dom_file = OUTPUT_DIR / f"chutes_sn64_dominant_user_{date}.json"
+        with open(dom_file, "w") as f:
+            json.dump(dominant_report, f, indent=2, default=str)
+        print(f"  {dom_file.name}")
 
     print(f"Outputs saved to {OUTPUT_DIR}/")
-    print(f"  {merged_file.name}")
-    print(f"  {div_file.name}")
-    print(f"  {meta_file.name}")
-    print(f"  {user_file.name}")
+    print(f"  {merged_file.name}"); print(f"  {div_file.name}"); print(f"  {meta_file.name}")
 
 
-# ── Entry Point ────────────────────────────────────────────────────────────────
+# ── Entry Point ───────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="SN64 Chutes Intelligence Market Analysis")
-    parser.add_argument("--root-threshold",  type=float, default=ROOT_TAO_THRESHOLD)
-    parser.add_argument("--alpha-threshold", type=float, default=SN64_ALPHA_THRESHOLD)
+    parser.add_argument("--root-threshold",  type=float, default=ROOT_TAO_THRESHOLD,
+                        help="Minimum TAO staked on Root to count as overlap validator")
+    parser.add_argument("--alpha-threshold", type=float, default=SN64_ALPHA_THRESHOLD,
+                        help="Minimum alpha staked on SN64 to count as validator")
     args = parser.parse_args()
     run_analysis(args.root_threshold, args.alpha_threshold)
 
